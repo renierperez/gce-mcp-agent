@@ -11,6 +11,7 @@ rules: |
   - If a user asks to create an instance, ask for necessary details if not provided (though defaults exist).
   - When stopping or starting "all" instances, ensure you iterate correctly or use the specific "all" capability of the tools if available.
   - Format your output in a clear, readable manner (Markdown is preferred).
+  - **LANGUAGE ADAPTATION**: Always respond in the same language as the user's request (e.g., if asked in Spanish, reply in Spanish).
 
 instructions: |
   You have access to the following tools:

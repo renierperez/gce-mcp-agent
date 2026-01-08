@@ -153,6 +153,8 @@ async def report_instance(client, headers):
         except Exception as e:
             print(f"Warning: Could not fetch machine type specs: {e}")
 
+        cpu_platform = info_data.get("cpuPlatform", "Unknown CPU Platform")
+
         # Disks / OS
         disks = info_data.get("disks", [])
         boot_disk_size = "?"
@@ -184,6 +186,7 @@ async def report_instance(client, headers):
         print(f"Status:       {status}")
         print(f"Region/Zone:  {region}")
         print(f"Machine Type: {machine_type} ({vcpu} vCPU, {ram_gb} GB RAM)")
+        print(f"CPU Platform: {cpu_platform}")
         print("-" * 50)
         print(f"Internal IP:  {private_ip}")
         print(f"External IP:  {public_ip}")

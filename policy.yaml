@@ -1,0 +1,3 @@
+constraint: constraints/compute.requireShieldedVm
+booleanPolicy:
+  enforced: false

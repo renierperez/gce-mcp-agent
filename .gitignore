@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.json
+!schema.json
+!tools_list.json
+sa-key.json
+output.txt

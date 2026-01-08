@@ -1,0 +1,24 @@
+{
+  "description": "Request message for stopping an instance.",
+  "properties": {
+    "name": {
+      "description": "Required. Identifier. The instance name.",
+      "type": "string",
+      "x-google-identifier": true
+    },
+    "project": {
+      "description": "Required. Project ID for this request.",
+      "type": "string"
+    },
+    "zone": {
+      "description": "Required. The zone of the instance.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "project",
+    "zone",
+    "name"
+  ],
+  "type": "object"
+}

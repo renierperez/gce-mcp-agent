@@ -94,13 +94,13 @@ async def list_instances(client, headers):
     }
     await call_mcp_tool(client, headers, "list_instances", payload)
 
-async def report_instance(client, headers):
-    print(f"Fetching enhanced metadata for instance: {INSTANCE_NAME}...")
+async def report_instance(client, headers, instance_name=INSTANCE_NAME):
+    print(f"Fetching enhanced metadata for instance: {instance_name}...")
     
     try:
         # Use gcloud to get full instance details in JSON format
         cmd = [
-            "gcloud", "compute", "instances", "describe", INSTANCE_NAME,
+            "gcloud", "compute", "instances", "describe", instance_name,
             f"--zone={ZONE}", 
             f"--project={PROJECT_ID}",
             "--format=json"
@@ -202,9 +202,52 @@ async def report_instance(client, headers):
     except json.JSONDecodeError:
         print("Error parsing gcloud output JSON.")
 
+async def create_custom_instance(headers, name, machine_type, image_family, image_project, extra_disk_size_gb):
+    print(f"Creating Custom Instance: {name}...")
+    print(f"  Type: {machine_type}")
+    print(f"  OS:   {image_family} ({image_project})")
+    print(f"  Disk: +{extra_disk_size_gb}GB Data Disk")
+
+    try:
+        # Construct gcloud command
+        cmd = [
+            "gcloud", "compute", "instances", "create", name,
+            f"--project={PROJECT_ID}",
+            f"--zone={ZONE}",
+            f"--machine-type={machine_type}",
+            f"--image-family={image_family}",
+            f"--image-project={image_project}",
+            "--no-address",  # Prevent external IP creation to avoid policy violation
+            # Boot disk is auto-created from image.
+            # Add extra data disk
+            f"--create-disk=mode=rw,size={extra_disk_size_gb},type=pd-standard,name={name}-data-1,auto-delete=yes"
+        ]
+        
+        print(f"  Running: {' '.join(cmd)}")
+        
+        # Run gcloud
+        output = await asyncio.to_thread(
+            lambda: subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+        )
+        print("  \nSuccess! gcloud output:")
+        print(output)
+
+    except subprocess.CalledProcessError as e:
+        print(f"Error creating instance: {e}")
+        if e.output:
+            print(f"gcloud output: {e.output}")
+
 async def main():
     parser = argparse.ArgumentParser(description="GCE Manager Agent CLI")
-    parser.add_argument("command", choices=["create", "stop", "start", "list", "report"], help="Action to perform")
+    parser.add_argument("command", choices=["create", "stop", "start", "list", "report", "create-custom"], help="Action to perform")
+    
+    # Optional args for create-custom
+    parser.add_argument("--name", default=INSTANCE_NAME, help="Instance Name")
+    parser.add_argument("--machine-type", default="e2-micro", help="Machine Type")
+    parser.add_argument("--image-family", default="debian-11", help="Image Family")
+    parser.add_argument("--image-project", default="debian-cloud", help="Image Project")
+    parser.add_argument("--disk-size", default="10", help="Extra Disk Size in GB")
+
     args = parser.parse_args()
 
     try:
@@ -215,6 +258,15 @@ async def main():
             
             if args.command == "create":
                 await create_instance(client, headers)
+            elif args.command == "create-custom":
+                await create_custom_instance(
+                    headers, 
+                    args.name, 
+                    args.machine_type, 
+                    args.image_family, 
+                    args.image_project, 
+                    args.disk_size
+                )
             elif args.command == "stop":
                 await stop_instance(client, headers)
             elif args.command == "start":
@@ -222,7 +274,7 @@ async def main():
             elif args.command == "list":
                 await list_instances(client, headers)
             elif args.command == "report":
-                await report_instance(client, headers)
+                await report_instance(client, headers, args.name)
 
     except Exception as e:
         print(f"\nError: {e}")

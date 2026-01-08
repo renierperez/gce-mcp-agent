@@ -73,15 +73,41 @@ def list_instances():
     except Exception as e:
         return f"Error listing instances: {e}"
 
+# Helper for Machine Type details (vCPU/RAM)
+def get_machine_type_details(machine_type, zone, project_id):
+    # Try to describe standard type
+    vcpu = "?"
+    ram_gb = "?"
+    try:
+        cmd_mt = [
+            "gcloud", "compute", "machine-types", "describe", machine_type,
+            f"--zone={zone}",
+            f"--project={project_id}",
+            "--format=json"
+        ]
+        mt_json = subprocess.check_output(cmd_mt, text=True).strip()
+        mt_data = json.loads(mt_json)
+        vcpu = mt_data.get("guestCpus", "?")
+        memory_mb = mt_data.get("memoryMb", 0)
+        ram_gb = f"{memory_mb / 1024:.1f}" if memory_mb else "?"
+    except Exception:
+        # Fallback for custom types (e.g. n2-custom-2-4096)
+        # Format: <family>-custom-<vcpus>-<mem_mb>
+        import re
+        match = re.search(r".*-custom-(\d+)-(\d+)", machine_type)
+        if match:
+             vcpu = match.group(1)
+             memory_mb = int(match.group(2))
+             ram_gb = f"{memory_mb / 1024:.1f}"
+    
+    return vcpu, ram_gb
+
 def get_instance_report(instance_name="all"):
     """
     Generates a detailed report for a specific instance or all instances.
     Args:
         instance_name: Name of the instance, or 'all' for all instances.
     """
-    # This logic mimics the 'report_instance' from main.py
-    # We will reuse the gcloud commands but return string output instead of printing
-    
     target_name = instance_name if instance_name and instance_name != "all" else None
     
     cmd = [
@@ -108,27 +134,89 @@ def get_instance_report(instance_name="all"):
             status = info.get("status", "Turned Off/Unknown")
             machine_type_url = info.get("machineType", "")
             machine_type = machine_type_url.split("/")[-1] if "/" in machine_type_url else machine_type_url
+            cpu_platform = info.get("cpuPlatform", "Unknown CPU Platform")
+            
+            # Fallback for terminated instances where CPU Platform is unknown
+            if cpu_platform == "Unknown CPU Platform" or not cpu_platform:
+                # Heuristics based on https://cloud.google.com/compute/docs/cpu-platforms
+                prefix = machine_type.split("-")[0]
+                
+                if prefix == "e2":
+                    cpu_platform = "Intel Broadwell/Haswell/Skylake (Estimated)"
+                elif prefix in ["n2", "n2-custom"]:
+                     cpu_platform = "Intel Cascade Lake/Ice Lake (Estimated)"
+                elif prefix == "n1":
+                     cpu_platform = "Intel Skylake/Haswell/Broadwell/Ivy Bridge (Estimated)"
+                elif prefix == "n2d":
+                     cpu_platform = "AMD EPYC Milan (Estimated)"
+                elif prefix == "t2d":
+                     cpu_platform = "AMD EPYC Milan (Estimated)"
+                elif prefix == "t2a":
+                     cpu_platform = "Ampere Altra (ARM)"
+                elif prefix in ["c2", "m2"]:
+                     cpu_platform = "Intel Cascade Lake/Skylake (Estimated)"
+                elif prefix in ["c3", "n4", "c4"]:
+                     cpu_platform = "Intel Sapphire Rapids/Emerald Rapids (Estimated)"
+                elif prefix == "a2":
+                     cpu_platform = "Intel Cascade Lake (Estimated)"
+                elif prefix == "g2":
+                     cpu_platform = "Intel Cascade Lake (Estimated)"
+                elif "custom" in machine_type:
+                    # Fallback for generic custom without family prefix (rare) OR n2-custom matches prefix logic above
+                     if "n2-custom" in machine_type:
+                         cpu_platform = "Intel Cascade Lake/Ice Lake (Estimated)"
+                     else:
+                         cpu_platform = "Intel/AMD (Unknown model)"
             
             # Networking
             priv_ip = "N/A"
+            pub_ip = "N/A"
             network_interfaces = info.get("networkInterfaces", [])
             if network_interfaces:
-                priv_ip = network_interfaces[0].get("networkIP", "N/A")
+                nic0 = network_interfaces[0]
+                priv_ip = nic0.get("networkIP", "N/A")
+                if nic0.get("accessConfigs"):
+                     pub_ip = nic0["accessConfigs"][0].get("natIP", "N/A")
             
             # Disks
             disks = info.get("disks", [])
             disk_info = []
+            os_name = "Unknown"
+            
             for d in disks:
                  sz = d.get("diskSizeGb", "?")
                  kind = "Boot" if d.get("boot") else "Data"
                  disk_info.append(f"{kind} ({sz} GB)")
+                 
+                 # Try to guess OS from licenses on boot disk
+                 if d.get("boot") and d.get("licenses"):
+                     for lic in d.get("licenses"):
+                         if "debian" in lic: os_name = "Debian"
+                         elif "rhel" in lic: os_name = "RHEL"
+                         elif "centos" in lic: os_name = "CentOS"
+                         elif "ubuntu" in lic: os_name = "Ubuntu"
+                         elif "windows" in lic: os_name = "Windows"
             
-            report_lines.append(f"INSTANCE: {name}")
-            report_lines.append(f"  Status: {status}")
-            report_lines.append(f"  Type: {machine_type}")
-            report_lines.append(f"  IP: {priv_ip}")
-            report_lines.append(f"  Disks: {', '.join(disk_info)}")
-            report_lines.append("-" * 30)
+            # Fetch VCPU/RAM details
+            # Note: sequential fetching for 'all' might be slow but provides the required detail.
+            # In a production agent we might cache or parallelize this.
+            vcpu, ram_gb = get_machine_type_details(machine_type, ZONE, PROJECT_ID)
+
+            report_lines.append("=" * 50)
+            report_lines.append(f" GCE INSTANCE REPORT: {name}")
+            report_lines.append("=" * 50)
+            report_lines.append(f"Status:       {status}")
+            report_lines.append(f"Region/Zone:  {ZONE}")
+            report_lines.append(f"Machine Type: {machine_type} ({vcpu} vCPU, {ram_gb} GB RAM)")
+            report_lines.append(f"CPU Platform: {cpu_platform}")
+            report_lines.append("-" * 50)
+            report_lines.append(f"Internal IP:  {priv_ip}")
+            report_lines.append(f"External IP:  {pub_ip}")
+            report_lines.append("-" * 50)
+            report_lines.append(f"OS:           {os_name}")
+            report_lines.append(f"Disk:         {', '.join(disk_info)}")
+            report_lines.append("=" * 50)
+            report_lines.append("") # Empty line between intances
 
         return "\n".join(report_lines)
 

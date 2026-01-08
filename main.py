@@ -154,12 +154,18 @@ async def print_instance_report(info_data):
 
     # Disks / OS
     disks = info_data.get("disks", [])
-    boot_disk_size = "?"
+    disk_info_list = []
     os_name = "Unknown Linux/OS"
     
     for disk in disks:
-        if disk.get("boot", False):
-            boot_disk_size = disk.get("diskSizeGb", "?")
+        size = disk.get("diskSizeGb", "?")
+        is_boot = disk.get("boot", False)
+        kind = "Boot" if is_boot else "Data"
+        disk_name = disk.get("deviceName", "unknown")
+        disk_info_list.append(f"{kind} ({disk_name}): {size} GB")
+
+        # Try to detect OS from boot disk
+        if is_boot:
             licenses = disk.get("licenses", [])
             for lic in licenses:
                 if "debian" in lic:
@@ -174,7 +180,6 @@ async def print_instance_report(info_data):
                     os_name = "CentOS"
                 elif "rhel" in lic:
                     os_name = "RHEL"
-            break
 
     # Print Report
     print("\n" + "="*50)
@@ -189,7 +194,8 @@ async def print_instance_report(info_data):
     print(f"External IP:  {public_ip}")
     print("-" * 50)
     print(f"OS:           {os_name}")
-    print(f"Boot Disk:    {boot_disk_size} GB")
+    for d_info in disk_info_list:
+        print(f"Disk:         {d_info}")
     print("="*50 + "\n")
 
 async def report_instance(client, headers, instance_name=None, report_all=False):

@@ -94,106 +94,137 @@ async def list_instances(client, headers):
     }
     await call_mcp_tool(client, headers, "list_instances", payload)
 
-async def report_instance(client, headers, instance_name=INSTANCE_NAME):
-    print(f"Fetching enhanced metadata for instance: {instance_name}...")
+async def print_instance_report(info_data):
+    # Extract Details
+    name = info_data.get("name", "Unknown")
+    status = info_data.get("status", "Turned Off/Unknown")
+    machine_type_url = info_data.get("machineType", "")
+    machine_type = machine_type_url.split("/")[-1] if "/" in machine_type_url else machine_type_url
+    zone_url = info_data.get("zone", "")
+    region = zone_url.split("/")[-1] if "/" in zone_url else zone_url
     
+    # Networking
+    network_interfaces = info_data.get("networkInterfaces", [])
+    private_ip = "N/A"
+    public_ip = "N/A"
+    
+    if network_interfaces:
+        nic0 = network_interfaces[0]
+        private_ip = nic0.get("networkIP", "N/A")
+        access_configs = nic0.get("accessConfigs", [])
+        if access_configs:
+            public_ip = access_configs[0].get("natIP", "N/A")
+    
+    # Machine Type Specs
+    vcpu = "?"
+    ram_gb = "?"
     try:
-        # Use gcloud to get full instance details in JSON format
+        # Optimization: To avoid N+1 calls, only fetch if we don't know it. 
+        # But for 'list all', N calls might be slow. 
+        # For now, keep it simple. If status is TERMINATED, maybe skip? NO, user wants report.
+        # We can just fetch it.
+        cmd_mt = [
+            "gcloud", "compute", "machine-types", "describe", machine_type,
+            f"--zone={ZONE}",
+            f"--project={PROJECT_ID}",
+            "--format=json"
+        ]
+        mt_json = await asyncio.to_thread(
+            lambda: subprocess.check_output(cmd_mt, text=True).strip()
+        )
+        mt_data = json.loads(mt_json)
+        vcpu = mt_data.get("guestCpus", "?")
+        memory_mb = mt_data.get("memoryMb", 0)
+        ram_gb = f"{memory_mb / 1024:.1f}" if memory_mb else "?"
+    except Exception:
+        # Some custom types might fail 'describe' if not handled perfectly, 
+        # or if name is custom-..., we can parse it from name too!
+        if "custom" in machine_type:
+            try:
+                # n2-custom-2-4096 -> 2 vcpu, 4096 mb
+                parts = machine_type.split("-")
+                vcpu = parts[2]
+                memory_mb = int(parts[3])
+                ram_gb = f"{memory_mb / 1024:.1f}"
+            except:
+                pass
+        pass
+
+    cpu_platform = info_data.get("cpuPlatform", "Unknown CPU Platform")
+
+    # Disks / OS
+    disks = info_data.get("disks", [])
+    boot_disk_size = "?"
+    os_name = "Unknown Linux/OS"
+    
+    for disk in disks:
+        if disk.get("boot", False):
+            boot_disk_size = disk.get("diskSizeGb", "?")
+            licenses = disk.get("licenses", [])
+            for lic in licenses:
+                if "debian" in lic:
+                    os_name = "Debian"
+                    if "11" in lic: os_name += " 11"
+                    if "12" in lic: os_name += " 12"
+                elif "ubuntu" in lic:
+                    os_name = "Ubuntu"
+                elif "windows" in lic:
+                    os_name = "Windows"
+                elif "centos" in lic:
+                    os_name = "CentOS"
+                elif "rhel" in lic:
+                    os_name = "RHEL"
+            break
+
+    # Print Report
+    print("\n" + "="*50)
+    print(f" GCE INSTANCE REPORT: {name}")
+    print("="*50)
+    print(f"Status:       {status}")
+    print(f"Region/Zone:  {region}")
+    print(f"Machine Type: {machine_type} ({vcpu} vCPU, {ram_gb} GB RAM)")
+    print(f"CPU Platform: {cpu_platform}")
+    print("-" * 50)
+    print(f"Internal IP:  {private_ip}")
+    print(f"External IP:  {public_ip}")
+    print("-" * 50)
+    print(f"OS:           {os_name}")
+    print(f"Boot Disk:    {boot_disk_size} GB")
+    print("="*50 + "\n")
+
+async def report_instance(client, headers, instance_name=None, report_all=False):
+    if report_all:
+        print(f"Fetching enhanced metadata for ALL instances in {ZONE}...")
         cmd = [
-            "gcloud", "compute", "instances", "describe", instance_name,
+            "gcloud", "compute", "instances", "list",
+            f"--filter=zone:({ZONE})",
+            f"--project={PROJECT_ID}",
+            "--format=json"
+        ]
+    else:
+        name_to_use = instance_name if instance_name else INSTANCE_NAME
+        print(f"Fetching enhanced metadata for instance: {name_to_use}...")
+        cmd = [
+            "gcloud", "compute", "instances", "describe", name_to_use,
             f"--zone={ZONE}", 
             f"--project={PROJECT_ID}",
             "--format=json"
         ]
-        
-        # Run synchronous subprocess in a thread
+    
+    try:
         json_output = await asyncio.to_thread(
             lambda: subprocess.check_output(cmd, text=True).strip()
         )
         
-        info_data = json.loads(json_output)
+        data = json.loads(json_output)
         
-        # Extract Details
-        name = info_data.get("name", "Unknown")
-        status = info_data.get("status", "Turned Off/Unknown")
-        machine_type_url = info_data.get("machineType", "")
-        machine_type = machine_type_url.split("/")[-1] if "/" in machine_type_url else machine_type_url
-        zone_url = info_data.get("zone", "")
-        region = zone_url.split("/")[-1] if "/" in zone_url else zone_url
-        
-        # Networking
-        network_interfaces = info_data.get("networkInterfaces", [])
-        private_ip = "N/A"
-        public_ip = "N/A"
-        
-        if network_interfaces:
-            nic0 = network_interfaces[0]
-            private_ip = nic0.get("networkIP", "N/A")
-            access_configs = nic0.get("accessConfigs", [])
-            if access_configs:
-                public_ip = access_configs[0].get("natIP", "N/A")
-        
-        # Machine Type Specs
-        vcpu = "?"
-        ram_gb = "?"
-        try:
-            cmd_mt = [
-                "gcloud", "compute", "machine-types", "describe", machine_type,
-                f"--zone={ZONE}",
-                f"--project={PROJECT_ID}",
-                "--format=json"
-            ]
-            mt_json = await asyncio.to_thread(
-                lambda: subprocess.check_output(cmd_mt, text=True).strip()
-            )
-            mt_data = json.loads(mt_json)
-            vcpu = mt_data.get("guestCpus", "?")
-            memory_mb = mt_data.get("memoryMb", 0)
-            ram_gb = f"{memory_mb / 1024:.1f}" if memory_mb else "?"
-        except Exception as e:
-            print(f"Warning: Could not fetch machine type specs: {e}")
-
-        cpu_platform = info_data.get("cpuPlatform", "Unknown CPU Platform")
-
-        # Disks / OS
-        disks = info_data.get("disks", [])
-        boot_disk_size = "?"
-        os_name = "Unknown Linux/OS"
-        
-        for disk in disks:
-            if disk.get("boot", False):
-                boot_disk_size = disk.get("diskSizeGb", "?")
-                licenses = disk.get("licenses", [])
-                for lic in licenses:
-                    if "debian" in lic:
-                        os_name = "Debian"
-                        if "11" in lic: os_name += " 11"
-                        if "12" in lic: os_name += " 12"
-                    elif "ubuntu" in lic:
-                        os_name = "Ubuntu"
-                    elif "windows" in lic:
-                        os_name = "Windows"
-                    elif "centos" in lic:
-                        os_name = "CentOS"
-                    elif "rhel" in lic:
-                        os_name = "RHEL"
-                break
-
-        # Print Report
-        print("\n" + "="*50)
-        print(f" GCE INSTANCE REPORT: {name}")
-        print("="*50)
-        print(f"Status:       {status}")
-        print(f"Region/Zone:  {region}")
-        print(f"Machine Type: {machine_type} ({vcpu} vCPU, {ram_gb} GB RAM)")
-        print(f"CPU Platform: {cpu_platform}")
-        print("-" * 50)
-        print(f"Internal IP:  {private_ip}")
-        print(f"External IP:  {public_ip}")
-        print("-" * 50)
-        print(f"OS:           {os_name}")
-        print(f"Boot Disk:    {boot_disk_size} GB")
-        print("="*50 + "\n")
+        if report_all:
+            # data is list
+            for instance in data:
+                await print_instance_report(instance)
+        else:
+            # data is dict
+            await print_instance_report(data)
 
     except subprocess.CalledProcessError as e:
         print(f"Error fetching instance details via gcloud: {e}")
@@ -247,6 +278,7 @@ async def main():
     parser.add_argument("--image-family", default="debian-11", help="Image Family")
     parser.add_argument("--image-project", default="debian-cloud", help="Image Project")
     parser.add_argument("--disk-size", default="10", help="Extra Disk Size in GB")
+    parser.add_argument("--all", action="store_true", help="Report all instances")
 
     args = parser.parse_args()
 
@@ -274,7 +306,7 @@ async def main():
             elif args.command == "list":
                 await list_instances(client, headers)
             elif args.command == "report":
-                await report_instance(client, headers, args.name)
+                await report_instance(client, headers, args.name, args.all)
 
     except Exception as e:
         print(f"\nError: {e}")

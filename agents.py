@@ -21,8 +21,8 @@ def create_agent():
     combined_instructions = f"{config.get('persona', '')}\n\n{config.get('rules', '')}\n\n{config.get('instructions', '')}"
     
     # Model configuration
-    # Reverted to gemini-2.0-flash-exp (Stable) as gemini-3-pro-preview is unavailable
-    model_name = os.environ.get("MODEL_NAME", "gemini-2.0-flash-exp")
+    # Updated to Gemini 2.5 Pro (gemini-2.5-pro)
+    model_name = os.environ.get("MODEL_NAME", "gemini-2.5-pro")
 
     agent = LlmAgent(
         name="GceManagerAgent",

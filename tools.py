@@ -19,7 +19,7 @@ async def get_authenticated_headers():
             "--format=value(token)"
         ]
         token = await asyncio.to_thread(
-            lambda: subprocess.check_output(cmd, text=True).strip()
+            lambda: subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).strip()
         )
         return {
             "Authorization": f"Bearer {token}",
@@ -63,7 +63,7 @@ def list_instances():
         "--format=json"
     ]
     try:
-        output = subprocess.check_output(cmd, text=True).strip()
+        output = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).strip()
         data = json.loads(output)
         # Simplify output for LLM
         summary = []
@@ -85,7 +85,7 @@ def get_machine_type_details(machine_type, zone, project_id):
             f"--project={project_id}",
             "--format=json"
         ]
-        mt_json = subprocess.check_output(cmd_mt, text=True).strip()
+        mt_json = subprocess.check_output(cmd_mt, text=True, stderr=subprocess.DEVNULL).strip()
         mt_data = json.loads(mt_json)
         vcpu = mt_data.get("guestCpus", "?")
         memory_mb = mt_data.get("memoryMb", 0)
@@ -121,7 +121,7 @@ def get_instance_report(instance_name="all"):
         cmd.insert(4, target_name) # Insert name after 'describe'
 
     try:
-        output = subprocess.check_output(cmd, text=True).strip()
+        output = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).strip()
         data = json.loads(output)
         
         # If describe, wrap in list to reuse logic
@@ -129,6 +129,13 @@ def get_instance_report(instance_name="all"):
             data = [data]
         
         report_lines = []
+        # Add Header Summary
+        report_lines.append("=" * 50)
+        report_lines.append(f" PROJECT: {PROJECT_ID}")
+        report_lines.append(f" TOTAL INSTANCES: {len(data)}")
+        report_lines.append("=" * 50)
+        report_lines.append("") # Spacing
+
         for info in data:
             name = info.get("name", "Unknown")
             status = info.get("status", "Turned Off/Unknown")
@@ -251,34 +258,50 @@ async def stop_instance(instance_name):
     res = await call_mcp_tool("stop_instance", payload)
     return f"Stop Instance '{instance_name}': {res}"
 
-async def create_custom_instance(name, machine_type="n2-custom-2-4096", image_family="rhel-9", disk_size="10"):
+async def create_custom_instance(name, machine_type="n2-custom-2-4096", image_family="rhel-9", boot_disk_size="10", extra_disk_size="0"):
     """
     Creates a new custom instance.
     Args:
         name: Name of the new instance.
         machine_type: Machine type (default: n2-custom-2-4096).
         image_family: Image family (default: rhel-9).
-        disk_size: Size of additional data disk in GB (default: 10).
+        boot_disk_size: Size of boot disk in GB (default: 10).
+        extra_disk_size: Size of additional data disk in GB (default: 0).
     """
+    # Sanitize name to comply with GCE regex (no underscores, lowercase)
+    final_name = name.lower().replace("_", "-")
+    
+    # Determine image project based on family
+    image_project = "rhel-cloud"
+    if "debian" in image_family:
+        image_project = "debian-cloud"
+    elif "ubuntu" in image_family:
+        image_project = "ubuntu-os-cloud"
+    elif "centos" in image_family:
+        image_project = "centos-cloud"
+
     cmd = [
-        "gcloud", "compute", "instances", "create", name,
+        "gcloud", "compute", "instances", "create", final_name,
         f"--project={PROJECT_ID}",
         f"--zone={ZONE}",
         f"--machine-type={machine_type}",
         "--network-interface=network-tier=PREMIUM,stack-type=IPV4_ONLY,subnet=default,no-address",
         "--maintenance-policy=MIGRATE",
         "--provisioning-model=STANDARD",
-        "--service-account=646392362677-compute@developer.gserviceaccount.com",
+        "--service-account=30162433848-compute@developer.gserviceaccount.com",
         "--scopes=https://www.googleapis.com/auth/devstorage.read_only,https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write,https://www.googleapis.com/auth/servicecontrol,https://www.googleapis.com/auth/service.management.readonly,https://www.googleapis.com/auth/trace.append",
-        f"--create-disk=auto-delete=yes,boot=yes,device-name={name},image=projects/rhel-cloud/global/images/family/{image_family},mode=rw,size=20,type=projects/{PROJECT_ID}/zones/{ZONE}/diskTypes/pd-balanced",
-        f"--create-disk=device-name={name}-data,mode=rw,name={name}-data,size={disk_size},type=projects/{PROJECT_ID}/zones/{ZONE}/diskTypes/pd-balanced,auto-delete=yes",
+        f"--create-disk=auto-delete=yes,boot=yes,device-name={final_name},image=projects/{image_project}/global/images/family/{image_family},mode=rw,size={boot_disk_size},type=projects/{PROJECT_ID}/zones/{ZONE}/diskTypes/pd-balanced",
         "--labels=goog-ec-src=vm_add-gcloud",
         "--format=json"
     ]
+
+    # Add extra disk only if requested
+    if extra_disk_size and int(extra_disk_size) > 0:
+        cmd.insert(-2, f"--create-disk=device-name={final_name}-data,mode=rw,name={final_name}-data,size={extra_disk_size},type=projects/{PROJECT_ID}/zones/{ZONE}/diskTypes/pd-balanced,auto-delete=yes")
     
     try:
         output = await asyncio.to_thread(
-            lambda: subprocess.check_output(cmd, text=True).strip()
+            lambda: subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).strip()
         )
         return f"Instance '{name}' created successfully.\nOutput: {output[:200]}..."
     except subprocess.CalledProcessError as e:

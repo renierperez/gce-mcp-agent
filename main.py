@@ -109,15 +109,43 @@ async def stop_instance(client, headers, instance_name=None, stop_all=False):
         }
         await call_mcp_tool(client, headers, "stop_instance", payload)
 
-async def start_instance(client, headers):
-    payload = {
-        "project": PROJECT_ID,
-        "zone": ZONE,
-        "name": INSTANCE_NAME
-    }
-    # Assuming start_instance has similar schema; if not available, this might fail or need check
-    # But usually start_instance schema mirrors stop_instance
-    await call_mcp_tool(client, headers, "start_instance", payload)
+async def start_instance(client, headers, instance_name=None, start_all=False):
+    instances_to_start = []
+
+    if start_all:
+        print(f"Listing all instances in {ZONE} to start them...")
+        try:
+            # List TERMINATED instances
+            cmd = [
+                "gcloud", "compute", "instances", "list",
+                f"--filter=zone:({ZONE}) AND status:TERMINATED",
+                f"--project={PROJECT_ID}",
+                "--format=json"
+            ]
+            output = await asyncio.to_thread(
+                lambda: subprocess.check_output(cmd, text=True).strip()
+            )
+            data = json.loads(output)
+            for inst in data:
+                instances_to_start.append(inst['name'])
+        except Exception as e:
+            print(f"Error listing instances to start: {e}")
+            return
+    else:
+        instances_to_start.append(instance_name if instance_name else INSTANCE_NAME)
+
+    if not instances_to_start:
+        print("No TERMINATED instances found to start.")
+        return
+
+    for name in instances_to_start:
+        print(f"Starting instance: {name}...")
+        payload = {
+            "project": PROJECT_ID,
+            "zone": ZONE,
+            "name": name
+        }
+        await call_mcp_tool(client, headers, "start_instance", payload)
 
 async def list_instances(client, headers):
     payload = {
@@ -340,7 +368,7 @@ async def main():
             elif args.command == "stop":
                 await stop_instance(client, headers, args.name, args.all)
             elif args.command == "start":
-                await start_instance(client, headers)
+                await start_instance(client, headers, args.name, args.all)
             elif args.command == "list":
                 await list_instances(client, headers)
             elif args.command == "report":

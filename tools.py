@@ -208,11 +208,19 @@ def get_instance_report(instance_name="all"):
                  # Try to guess OS from licenses on boot disk
                  if d.get("boot") and d.get("licenses"):
                      for lic in d.get("licenses"):
-                         if "debian" in lic: os_name = "Debian"
-                         elif "rhel" in lic: os_name = "RHEL"
-                         elif "centos" in lic: os_name = "CentOS"
-                         elif "ubuntu" in lic: os_name = "Ubuntu"
-                         elif "windows" in lic: os_name = "Windows"
+                         # License URL format: .../global/licenses/<license-name>
+                         # We want to extract <license-name> and format it nicely
+                         if "debian" in lic or "rhel" in lic or "centos" in lic or "ubuntu" in lic or "windows" in lic or "sles" in lic:
+                             parts = lic.split("/")
+                             license_name = parts[-1]
+                             # Formatting: debian-11-bullseye -> Debian 11 Bullseye
+                             os_name = license_name.replace("-", " ").title()
+                             # Shorten common prefixes if redundant
+                             if os_name.startswith("Debian ") or os_name.startswith("Rhel ") or os_name.startswith("Ubuntu ") or os_name.startswith("Centos "):
+                                 pass # Already good
+                             elif "Windows" in os_name:
+                                 pass # Windows serv...
+                             break
 
             # Recommendations
             rec_text, savings = get_instance_recommendations(PROJECT_ID, ZONE, name)

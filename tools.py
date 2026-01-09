@@ -102,6 +102,46 @@ def get_machine_type_details(machine_type, zone, project_id):
     
     return vcpu, ram_gb
 
+def get_instance_recommendations(project, zone, instance_name):
+    """
+    Fetches sizing recommendations and estimated savings.
+    Returns: (recommendation_text, savings_usd)
+    """
+    rec_text = "None"
+    savings = "0.00"
+    
+    try:
+        # Check MachineTypeRecommender
+        cmd = [
+            "gcloud", "recommender", "recommendations", "list",
+            f"--project={project}",
+            f"--location={zone}",
+            f"--recommender=google.compute.instance.MachineTypeRecommender",
+            "--format=json"
+        ]
+        output = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).strip()
+        recs = json.loads(output)
+        
+        for r in recs:
+            # Filter for specific instance (target resource contains instance name)
+            if f"/instances/{instance_name}" in r.get("content", {}).get("operationGroups", [{}])[0].get("operations", [{}])[0].get("resource", ""):
+                description = r.get("description", "")
+                rec_text = description
+                
+                # Calculate savings
+                cost = r.get("primaryImpact", {}).get("costProjection", {}).get("cost", {})
+                if cost.get("currencyCode") == "USD":
+                    units = int(cost.get("units", "0"))
+                    nanos = cost.get("nanos", 0)
+                    total = abs(units + (nanos / 1e9)) # Savings are usually negative
+                    savings = f"{total:.2f}"
+                break
+                
+    except Exception:
+        pass
+        
+    return rec_text, savings
+
 def get_instance_report(instance_name="all"):
     """
     Generates a detailed report for a specific instance or all instances.
@@ -139,41 +179,12 @@ def get_instance_report(instance_name="all"):
         for info in data:
             name = info.get("name", "Unknown")
             status = info.get("status", "Turned Off/Unknown")
+            creation_ts = info.get("creationTimestamp", "Unknown")
             machine_type_url = info.get("machineType", "")
             machine_type = machine_type_url.split("/")[-1] if "/" in machine_type_url else machine_type_url
-            cpu_platform = info.get("cpuPlatform", "Unknown CPU Platform")
             
-            # Fallback for terminated instances where CPU Platform is unknown
-            if cpu_platform == "Unknown CPU Platform" or not cpu_platform:
-                # Heuristics based on https://cloud.google.com/compute/docs/cpu-platforms
-                prefix = machine_type.split("-")[0]
-                
-                if prefix == "e2":
-                    cpu_platform = "Intel Broadwell/Haswell/Skylake (Estimated)"
-                elif prefix in ["n2", "n2-custom"]:
-                     cpu_platform = "Intel Cascade Lake/Ice Lake (Estimated)"
-                elif prefix == "n1":
-                     cpu_platform = "Intel Skylake/Haswell/Broadwell/Ivy Bridge (Estimated)"
-                elif prefix == "n2d":
-                     cpu_platform = "AMD EPYC Milan (Estimated)"
-                elif prefix == "t2d":
-                     cpu_platform = "AMD EPYC Milan (Estimated)"
-                elif prefix == "t2a":
-                     cpu_platform = "Ampere Altra (ARM)"
-                elif prefix in ["c2", "m2"]:
-                     cpu_platform = "Intel Cascade Lake/Skylake (Estimated)"
-                elif prefix in ["c3", "n4", "c4"]:
-                     cpu_platform = "Intel Sapphire Rapids/Emerald Rapids (Estimated)"
-                elif prefix == "a2":
-                     cpu_platform = "Intel Cascade Lake (Estimated)"
-                elif prefix == "g2":
-                     cpu_platform = "Intel Cascade Lake (Estimated)"
-                elif "custom" in machine_type:
-                    # Fallback for generic custom without family prefix (rare) OR n2-custom matches prefix logic above
-                     if "n2-custom" in machine_type:
-                         cpu_platform = "Intel Cascade Lake/Ice Lake (Estimated)"
-                     else:
-                         cpu_platform = "Intel/AMD (Unknown model)"
+            # Fetch VCPU/RAM details
+            vcpu, ram_gb = get_machine_type_details(machine_type, ZONE, PROJECT_ID)
             
             # Networking
             priv_ip = "N/A"
@@ -187,13 +198,12 @@ def get_instance_report(instance_name="all"):
             
             # Disks
             disks = info.get("disks", [])
-            disk_info = []
+            total_disk_gb = 0
             os_name = "Unknown"
             
             for d in disks:
-                 sz = d.get("diskSizeGb", "?")
-                 kind = "Boot" if d.get("boot") else "Data"
-                 disk_info.append(f"{kind} ({sz} GB)")
+                 sz = int(d.get("diskSizeGb", "0"))
+                 total_disk_gb += sz
                  
                  # Try to guess OS from licenses on boot disk
                  if d.get("boot") and d.get("licenses"):
@@ -203,26 +213,24 @@ def get_instance_report(instance_name="all"):
                          elif "centos" in lic: os_name = "CentOS"
                          elif "ubuntu" in lic: os_name = "Ubuntu"
                          elif "windows" in lic: os_name = "Windows"
-            
-            # Fetch VCPU/RAM details
-            # Note: sequential fetching for 'all' might be slow but provides the required detail.
-            # In a production agent we might cache or parallelize this.
-            vcpu, ram_gb = get_machine_type_details(machine_type, ZONE, PROJECT_ID)
 
-            report_lines.append("=" * 50)
-            report_lines.append(f" GCE INSTANCE REPORT: {name}")
-            report_lines.append("=" * 50)
-            report_lines.append(f"Status:       {status}")
-            report_lines.append(f"Region/Zone:  {ZONE}")
-            report_lines.append(f"Machine Type: {machine_type} ({vcpu} vCPU, {ram_gb} GB RAM)")
-            report_lines.append(f"CPU Platform: {cpu_platform}")
+            # Recommendations
+            rec_text, savings = get_instance_recommendations(PROJECT_ID, ZONE, name)
+
+            report_lines.append(f"Instance Name:           {name}")
+            report_lines.append(f"Project ID:              {PROJECT_ID}")
+            report_lines.append(f"Instance Status:         {status}")
+            report_lines.append(f"Creation Timestamp:      {creation_ts}")
+            report_lines.append(f"Machine Type:            {machine_type}")
+            report_lines.append(f"Number of vCPUs:         {vcpu}")
+            report_lines.append(f"RAM (GB):                {ram_gb}")
+            report_lines.append(f"Total Disk Size (GB):    {total_disk_gb}")
+            report_lines.append(f"IP Address:              {priv_ip} (Internal) / {pub_ip} (External)")
+            report_lines.append(f"Zone:                    {ZONE}")
+            report_lines.append(f"Operating System:        {os_name}")
+            report_lines.append(f"Sizing Recommendations:  {rec_text}")
+            report_lines.append(f"Estimated Monthly Savings (USD): ${savings}")
             report_lines.append("-" * 50)
-            report_lines.append(f"Internal IP:  {priv_ip}")
-            report_lines.append(f"External IP:  {pub_ip}")
-            report_lines.append("-" * 50)
-            report_lines.append(f"OS:           {os_name}")
-            report_lines.append(f"Disk:         {', '.join(disk_info)}")
-            report_lines.append("=" * 50)
             report_lines.append("") # Empty line between intances
 
         return "\n".join(report_lines)

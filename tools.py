@@ -199,11 +199,14 @@ def get_instance_report(instance_name="all"):
             # Disks
             disks = info.get("disks", [])
             total_disk_gb = 0
+            disk_details = []
             os_name = "Unknown"
             
             for d in disks:
                  sz = int(d.get("diskSizeGb", "0"))
                  total_disk_gb += sz
+                 kind = "Boot" if d.get("boot") else "Data"
+                 disk_details.append(f"{kind} {sz}GB")
                  
                  # Try to guess OS from licenses on boot disk
                  if d.get("boot") and d.get("licenses"):
@@ -232,7 +235,7 @@ def get_instance_report(instance_name="all"):
             report_lines.append(f"Machine Type:            {machine_type}")
             report_lines.append(f"Number of vCPUs:         {vcpu}")
             report_lines.append(f"RAM (GB):                {ram_gb}")
-            report_lines.append(f"Total Disk Size (GB):    {total_disk_gb}")
+            report_lines.append(f"Total Disk Size (GB):    {total_disk_gb} ({len(disks)} disks: {', '.join(disk_details)})")
             report_lines.append(f"IP Address:              {priv_ip} (Internal) / {pub_ip} (External)")
             report_lines.append(f"Zone:                    {ZONE}")
             report_lines.append(f"Operating System:        {os_name}")

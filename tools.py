@@ -32,6 +32,9 @@ def get_recommender_client():
     # Actually global endpoint is fine for some, but let's stick to default unless issues.
     return recommender_v1.RecommenderClient()
 
+def get_disks_client():
+    return compute_v1.DisksClient()
+
 # --- Tools exposed to the Agent ---
 
 async def list_instances():
@@ -185,11 +188,27 @@ async def get_instance_report(instance_name="all"):
     Generates a detailed report using native Python client.
     """
     try:
-        client = get_instances_client()
-        request = compute_v1.ListInstancesRequest(project=PROJECT_ID, zone=ZONE)
+        instances_client = get_instances_client()
+        disks_client = get_disks_client()
         
-        # Fetch all efficiently
-        all_instances = await asyncio.to_thread(client.list, request)
+        inst_request = compute_v1.ListInstancesRequest(project=PROJECT_ID, zone=ZONE)
+        disk_request = compute_v1.ListDisksRequest(project=PROJECT_ID, zone=ZONE)
+        
+        # Fetch all efficiently (Parallel)
+        all_instances, all_disks = await asyncio.gather(
+            asyncio.to_thread(instances_client.list, inst_request),
+            asyncio.to_thread(disks_client.list, disk_request)
+        )
+        
+        # Map Disk URL -> Type
+        disk_type_map = {}
+        for d in all_disks:
+            # d.type is url e.g. .../diskTypes/pd-balanced
+            dt_short = d.type.split("/")[-1]
+            readable_type = dt_short.replace("pd-", "").capitalize()
+            if readable_type == "Ssd": readable_type = "SSD"
+            if readable_type == "Standard": readable_type = "Standard (HDD)"
+            disk_type_map[d.self_link] = readable_type
         
         # Filter if single
         target_list = []
@@ -201,10 +220,8 @@ async def get_instance_report(instance_name="all"):
             return f"Instance '{instance_name}' not found."
 
         report_lines = []
-        report_lines.append("=" * 50)
-        report_lines.append(f" PROJECT: {PROJECT_ID}")
-        report_lines.append(f" TOTAL INSTANCES: {len(target_list)}")
-        report_lines.append("=" * 50)
+        report_lines.append(f"# 📊 GCE Report for Project `{PROJECT_ID}`")
+        report_lines.append(f"**Total Instances:** {len(target_list)}")
         report_lines.append("")
 
         for inst in target_list:
@@ -216,13 +233,6 @@ async def get_instance_report(instance_name="all"):
             # Machine Type
             mt_url = inst.machine_type
             short_mt = mt_url.split("/")[-1]
-            
-            # Async fetch details (or sync in thread)? 
-            # We are already in async, but `get_machine_type_details_sync` uses a client.
-            # Doing it sequentially for now inside this thread wrapper? 
-            # Actually we can't await inside the list comprehension easily if we use `await asyncio.to_thread` for the whole block.
-            # Warning: calling sync API here might block the loop if not careful.
-            # But we are inside `async def`, so we should use `await asyncio.to_thread`.
             
             vcpu, ram_gb = await asyncio.to_thread(get_machine_type_details_sync, short_mt, ZONE, PROJECT_ID)
             
@@ -245,11 +255,18 @@ async def get_instance_report(instance_name="all"):
                 sz = d.disk_size_gb
                 total_disk_gb += sz
                 kind = "Boot" if d.boot else "Data"
-                disk_details.append(f"{kind} {sz}GB")
+                
+                # Resolve Type
+                dtype = "Unknown"
+                if d.source in disk_type_map:
+                    dtype = disk_type_map[d.source]
+                elif d.type == "SCRATCH":
+                    dtype = "Local SSD"
+                    
+                disk_details.append(f"{kind} {sz}GB ({dtype})")
                 
                 if d.boot and d.licenses:
                     for lic in d.licenses:
-                        # License URL
                         parts = lic.split("/")
                         license_name = parts[-1]
                         if any(x in lic for x in ["debian", "rhel", "centos", "ubuntu", "windows", "sles"]):
@@ -259,20 +276,29 @@ async def get_instance_report(instance_name="all"):
             # Recommendations
             rec_text, savings = await get_instance_recommendations(PROJECT_ID, ZONE, name)
             
-            report_lines.append(f"Instance Name:           {name}")
-            report_lines.append(f"Project ID:              {PROJECT_ID}")
-            report_lines.append(f"Instance Status:         {status}")
-            report_lines.append(f"Creation Timestamp:      {creation_ts}")
-            report_lines.append(f"Machine Type:            {short_mt}")
-            report_lines.append(f"Number of vCPUs:         {vcpu}")
-            report_lines.append(f"RAM (GB):                {ram_gb}")
-            report_lines.append(f"Total Disk Size (GB):    {total_disk_gb} ({len(disks)} disks: {', '.join(disk_details)})")
-            report_lines.append(f"IP Address:              {priv_ip} (Internal) / {pub_ip} (External)")
-            report_lines.append(f"Zone:                    {ZONE}")
-            report_lines.append(f"Operating System:        {os_name}")
-            report_lines.append(f"Sizing Recommendations:  {rec_text}")
-            report_lines.append(f"Estimated Monthly Savings (USD): ${savings}")
-            report_lines.append("-" * 50)
+            # Markdown Formatting
+            report_lines.append(f"### 🖥️ Instance Name: `{name}`")
+            report_lines.append(f"- **Project ID**: `{PROJECT_ID}`")
+            report_lines.append(f"- **Instance Status**: `{status}`")
+            report_lines.append(f"- **Creation Timestamp**: `{creation_ts}`")
+            report_lines.append(f"- **Machine Type**: `{short_mt}`")
+            report_lines.append(f"- **Number of vCPUs**: {vcpu}")
+            report_lines.append(f"- **RAM (GB)**: {ram_gb}")
+            report_lines.append(f"- **Operating System**: {os_name}")
+            report_lines.append(f"- **IP Address**: Internal: `{priv_ip}` / External: `{pub_ip}`")
+            report_lines.append(f"- **Total Disk Size (GB)**: {total_disk_gb} GB Total ({', '.join(disk_details)})")
+            report_lines.append(f"- **Zone**: `{ZONE}`")
+            
+            # Recommendations (Always show field if requested, but keep it clean)
+            if rec_text != "None" or float(savings) > 0:
+                 report_lines.append(f"\n> 💡 **Sizing Recommendations**: {rec_text}")
+                 report_lines.append(f"> **Estimated Monthly Savings (USD)**: ${savings}")
+            else:
+                 report_lines.append(f"- **Sizing Recommendations**: None")
+                 report_lines.append(f"- **Estimated Monthly Savings (USD)**: $0.00")
+            
+            report_lines.append("") # Spacer
+            report_lines.append("---")
             report_lines.append("")
 
         return "\n".join(report_lines)

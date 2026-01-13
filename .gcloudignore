@@ -7,5 +7,6 @@ sa-key.json
 output.txt
 !frontend/web/manifest.json
 
-# Firebase Config (Secrets)
+# Firebase Config (Secrets) - Ignored by git but INCLUDED in Cloud Build
 frontend/lib/firebase_config.dart
+!frontend/lib/firebase_config.dart

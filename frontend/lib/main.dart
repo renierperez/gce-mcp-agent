@@ -4,19 +4,12 @@ import 'package:firebase_core/firebase_core.dart';
 import 'chat_screen.dart';
 import 'auth_service.dart';
 import 'login_page.dart';
+import 'firebase_config.dart'; // Import the gitignored config
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   
-  const FirebaseOptions? firebaseOptions = FirebaseOptions(
-    apiKey: "AIzaSyAhsbe9fxcqEws_VSXuAVTvk3EeHnGw3AY",
-    authDomain: "autonomous-agent-479317.firebaseapp.com",
-    projectId: "autonomous-agent-479317",
-    storageBucket: "autonomous-agent-479317.firebasestorage.app",
-    messagingSenderId: "30162433848",
-    appId: "1:30162433848:web:cc4faaecdb0354e974b3cd",
-    measurementId: "G-JZNRSKL534"
-  );
+  // firebaseOptions is imported from firebase_config.dart
 
   try {
     if (firebaseOptions != null) {

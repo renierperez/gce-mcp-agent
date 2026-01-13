@@ -252,30 +252,46 @@ def get_instance_report(instance_name="all"):
 async def start_instance(instance_name):
     """Starts a specific GCE instance."""
     if instance_name == "all":
-         # Re-implement start all locally or reuse main logic logic?
-         # For simplicity, let's just support single or handle 'all' by listing
-         # But the agent might handle loop. Let's support strict name for now
-         # checking if user meant all?
-         pass
-         
-    # Call MCP
-    payload = {
-        "project": PROJECT_ID,
-        "zone": ZONE,
-        "name": instance_name
-    }
-    res = await call_mcp_tool("start_instance", payload)
-    return f"Start Instance '{instance_name}': {res}"
+         # TODO: Handle 'all' logic if needed, for now restrict or iterate
+         return "Updating 'all' instances is not yet supported in this function."
+
+    cmd = [
+        "gcloud", "compute", "instances", "start", instance_name,
+        f"--zone={ZONE}",
+        f"--project={PROJECT_ID}",
+        "--format=json"
+    ]
+    try:
+        output = await asyncio.to_thread(
+            lambda: subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT).strip()
+        )
+        # Parse simplified output?
+        return f"Instance '{instance_name}' started successfully.\nDetails: {output[:200]}..."
+    except subprocess.CalledProcessError as e:
+        return f"Error starting instance '{instance_name}': {e.output}"
+    except Exception as e:
+        return f"Unexpected error starting instance: {e}"
 
 async def stop_instance(instance_name):
     """Stops a specific GCE instance."""
-    payload = {
-        "project": PROJECT_ID,
-        "zone": ZONE,
-        "name": instance_name
-    }
-    res = await call_mcp_tool("stop_instance", payload)
-    return f"Stop Instance '{instance_name}': {res}"
+    if instance_name == "all":
+         return "Updating 'all' instances is not yet supported in this function."
+
+    cmd = [
+        "gcloud", "compute", "instances", "stop", instance_name,
+        f"--zone={ZONE}",
+        f"--project={PROJECT_ID}",
+        "--format=json"
+    ]
+    try:
+        output = await asyncio.to_thread(
+            lambda: subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT).strip()
+        )
+        return f"Instance '{instance_name}' stopped successfully.\nDetails: {output[:200]}..."
+    except subprocess.CalledProcessError as e:
+        return f"Error stopping instance '{instance_name}': {e.output}"
+    except Exception as e:
+        return f"Unexpected error stopping instance: {e}"
 
 async def create_custom_instance(name, machine_type="n2-custom-2-4096", image_family="rhel-9", boot_disk_size="10", extra_disk_size="0"):
     """

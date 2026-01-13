@@ -14,10 +14,9 @@ class LoginPage extends StatelessWidget {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Icon(
-              Icons.shield_moon_rounded, 
-              size: 80, 
-              color: Theme.of(context).colorScheme.primary
+            Image.asset(
+              'assets/logo.png',
+              height: 100,
             ),
             const SizedBox(height: 24),
             Text(

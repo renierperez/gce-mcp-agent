@@ -1,26 +1,82 @@
-# GCE MCP Agent
+# GCE Manager Agent 🤖☁️
 
-An intelligent agent backend for managing Google Compute Engine (GCE) instances using the Model Context Protocol (MCP).
+A secure, **Multi-Agent System** for managing Google Compute Engine infrastructure using natural language. Built with the **Google Agent Development Kit (ADK)**, powered by **Gemini 2.5 Pro**, and deployed on **Cloud Run** with a modern **Flutter Web** interface.
 
-## Features
-- **MCP Integration**: Uses the official Google Compute Engine MCP server (`compute.googleapis.com/mcp`).
-- **Commands**:
-  - `list`: List all instances in the configured zone.
-  - `start`: Start a specific instance.
-  - `stop`: Stop a specific instance.
-  - `report`: Generate a detailed metadata report (IPs, Region, Hardware Specs, OS).
-- **Authentication**: Supports Service Account Impersonation via `gcloud`.
+![Flutter UI](https://storage.googleapis.com/cms-storage-bucket/0dbfcc7a59cd1cf16282.png) 
+*(Example UI style - Material 3)*
 
-## Usage
-```bash
-# List instances
-python3 main.py list
+## 🚀 Key Features
 
-# Generate Report
-python3 main.py report
+- **Natural Language DevOps**: "Start the development instance", "List all running servers", "Why is my bill so high?".
+- **Secure Public Access**: Accessible from anywhere (no VPN required) via **Zero Trust** security.
+- **Dynamic Access Control**: Manage authorized users in real-time via **Firestore** (no redeployment needed).
+- **Modern UI**: Responsive Flutter Web application with Markdown support for rich reports.
+- **Cost Aware**: Analyzes machine types and provider specs (powered by Gemini).
+
+## 🏗️ Architecture
+
+The system follows a split architecture deployed on **Google Cloud Run**:
+
+```mermaid
+graph LR
+    User[User (Browser)] -->|HTTPS + Firebase Auth| Frontend[Flutter Web App]
+    Frontend -->|JWT Bearer Token| Backend[FastAPI Backend]
+    Backend -->|Verify Token| Firestore[Firestore (Allowlist)]
+    Backend -->|LLM Reasoning| Gemini[Gemini 2.5 Pro]
+    Backend -->|MCP Ops| GCE[Compute Engine API]
 ```
 
-## Requirements
-- Python 3.10+
-- `gcloud` CLI installed and authenticated
-- Google Cloud Project with GCE API enabled
+- **Frontend**: Flutter Web (Material 3) served via Nginx container.
+- **Backend**: Python 3.13 + FastAPI + ADK (`LlmAgent`).
+- **Auth**: Google Sign-In (Firebase Authentication).
+- **Authorization**: Custom middleware checking `allowed_users` collection in Firestore.
+
+## 🛠️ Setup & Deployment
+
+### Prerequisites
+1.  **Google Cloud Project** with Billing enabled.
+2.  **Firebase Project** linked to the GCP Project.
+3.  **GCloud CLI** installed and authenticated.
+
+### 1. Configuration
+This repository uses a **secure configuration pattern**. The Firebase config is **not** committed to the repo.
+
+1.  Copy the example config:
+    ```bash
+    cp frontend/lib/firebase_config_example.dart frontend/lib/firebase_config.dart
+    ```
+2.  Edit `frontend/lib/firebase_config.dart` with your actual Firebase values.
+
+### 2. Firestore Access Control
+To authorize a user, create a document in your **Firestore Database**:
+- **Collection**: `allowed_users`
+- **Document ID**: `email@domain.com` (The user's Google Email)
+- **Field**: `active` (boolean: `true`)
+
+### 3. Deploy
+Run the automated deployment script. It handles building containers, submitting to Artifact Registry, and deploying strict IAM policies.
+
+```bash
+./deploy.sh
+```
+
+*(Note: The script automatically handles `repo-to-cloudbuild` secret transfer via `.gcloudignore` whitelisting)*.
+
+## 🔐 Security Model
+
+This project uses a **Defense-in-Depth** strategy:
+1.  **Identity**: Authenticated via Google (Firebase Auth).
+2.  **Authorization**: Token verification on every Backend request. Checks dynamic Firestore allowlist.
+3.  **Infrastructure**: Hosted on managed Serverless infrastructure (Cloud Run).
+4.  **Secrets**: No keys in the repository. Configs are injected at build time.
+
+## 🧩 Tech Stack
+- **AI Model**: Gemini 2.5 Pro
+- **Framework**: Google ADK (Agent Development Kit)
+- **Frontend**: Flutter 3.x (Web)
+- **Backend**: FastAPI (Python)
+- **Database**: Firestore (NoSQL)
+- **Infrastructure**: Cloud Run + Cloud Build
+
+## 📄 License
+MIT

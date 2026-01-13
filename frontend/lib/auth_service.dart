@@ -37,7 +37,14 @@ class AuthService {
 
   // Sign out
   Future<void> signOut() async {
-    await _googleSignIn.signOut();
+    try {
+      if (!kIsWeb) {
+         await _googleSignIn.signOut();
+      }
+    } catch (e) {
+      print("Google Sign Out Error: $e");
+    }
+    // Always sign out from Firebase
     await _auth.signOut();
   }
 

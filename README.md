@@ -19,11 +19,11 @@ The system follows a split architecture deployed on **Google Cloud Run**:
 
 ```mermaid
 graph LR
-    User[User (Browser)] -->|HTTPS + Firebase Auth| Frontend[Flutter Web App]
-    Frontend -->|JWT Bearer Token| Backend[FastAPI Backend]
-    Backend -->|Verify Token| Firestore[Firestore (Allowlist)]
-    Backend -->|LLM Reasoning| Gemini[Gemini 2.5 Pro]
-    Backend -->|MCP Ops| GCE[Compute Engine API]
+    User["User (Browser)"] -->|"HTTPS + Firebase Auth"| Frontend["Flutter Web App"]
+    Frontend -->|"JWT Bearer Token"| Backend["FastAPI Backend"]
+    Backend -->|"Verify Token"| Firestore["Firestore (Allowlist)"]
+    Backend -->|"LLM Reasoning"| Gemini["Gemini 2.5 Pro"]
+    Backend -->|"MCP Ops"| GCE["Compute Engine API"]
 ```
 
 - **Frontend**: Flutter Web (Material 3) served via Nginx container.

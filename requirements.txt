@@ -1,5 +1,6 @@
-mcp
-google-auth
-httpx
 google-adk
 pyyaml
+httpx
+fastapi
+uvicorn
+firebase-admin

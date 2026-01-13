@@ -6,3 +6,4 @@ uvicorn
 firebase-admin
 google-cloud-compute
 google-cloud-recommender
+google-cloud-billing

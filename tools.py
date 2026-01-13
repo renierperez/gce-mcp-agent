@@ -1,238 +1,269 @@
 import asyncio
 import subprocess
 import json
-import httpx
+import logging
+from google.cloud import compute_v1
+from google.cloud import recommender_v1
+from google.api_core.client_options import ClientOptions
 
 # Configuration
 PROJECT_ID = "autonomous-agent-479317"
 ZONE = "us-central1-a"
-INSTANCE_NAME = "mcp-test-instance-v1"
+REGION = "us-central1"
+# SERVICE_ACCOUNT is used for impersonation in CLI, might not be needed for native client on Cloud Run
+# if the Cloud Run SA has permissions.
 SERVICE_ACCOUNT = "mcp-manager@autonomous-agent-479317.iam.gserviceaccount.com"
-MCP_URL = "https://compute.googleapis.com/mcp"
 
-async def get_authenticated_headers():
-    # Helper to get headers (Internal use)
-    try:
-        cmd = [
-            "gcloud", "auth", "print-access-token",
-            f"--impersonate-service-account={SERVICE_ACCOUNT}",
-            "--format=value(token)"
-        ]
-        token = await asyncio.to_thread(
-            lambda: subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).strip()
-        )
-        return {
-            "Authorization": f"Bearer {token}",
-        }
-    except Exception as e:
-        print(f"Error getting token: {e}")
-        return {}
+# Initialize Logging
+logger = logging.getLogger(__name__)
 
-async def call_mcp_tool(tool_name, arguments):
-    # Helper to call MCP (Internal use)
-    headers = await get_authenticated_headers()
-    payload = {
-        "jsonrpc": "2.0",
-        "method": "tools/call",
-        "params": {
-            "name": tool_name,
-            "arguments": arguments
-        },
-        "id": 1
-    }
-    
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(MCP_URL, headers=headers, json=payload, timeout=120.0)
-            if response.status_code == 200:
-                return response.json()
-            else:
-                return {"error": response.text}
-        except Exception as e:
-            return {"error": str(e)}
+# --- Clients ---
+# We initialize these lazily or globally. Global is fine for Cloud Run (warm instances).
+# Note: On Cloud Run, default credentials are used.
+def get_instances_client():
+    return compute_v1.InstancesClient()
+
+def get_zone_operations_client():
+    return compute_v1.ZoneOperationsClient()
+
+def get_recommender_client():
+    # Recommender requires regional endpoint usually
+    opts = ClientOptions(api_endpoint=f"recommender.{REGION}.rep.googleapis.com")
+    # Actually global endpoint is fine for some, but let's stick to default unless issues.
+    return recommender_v1.RecommenderClient()
 
 # --- Tools exposed to the Agent ---
 
-def list_instances():
+async def list_instances():
     """Lists all GCE instances in the configured zone."""
-    # Using gcloud for consistent reporting structure as used in main
-    cmd = [
-        "gcloud", "compute", "instances", "list",
-        f"--filter=zone:({ZONE})",
-        f"--project={PROJECT_ID}",
-        "--format=json"
-    ]
     try:
-        output = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).strip()
-        data = json.loads(output)
-        # Simplify output for LLM
+        client = get_instances_client()
+        # List instances request
+        request = compute_v1.ListInstancesRequest(
+            project=PROJECT_ID,
+            zone=ZONE
+        )
+        
+        # This is a sync call, wrap in asyncio.to_thread to avoid blocking event loop
+        page_result = await asyncio.to_thread(client.list, request)
+        
         summary = []
-        for inst in data:
-            summary.append(f"Name: {inst['name']}, Status: {inst['status']}, IP: {inst['networkInterfaces'][0].get('networkIP', 'N/A')}")
-        return "\n".join(summary)
+        for inst in page_result:
+            # inst is an Instance object
+            ip = "N/A"
+            if inst.network_interfaces:
+                ip = inst.network_interfaces[0].network_i_p
+            
+            summary.append(f"Name: {inst.name}, Status: {inst.status}, IP: {ip}")
+            
+        return "\n".join(summary) if summary else "No instances found."
     except Exception as e:
+        logger.error(f"Error listing instances: {e}")
         return f"Error listing instances: {e}"
 
-# Helper for Machine Type details (vCPU/RAM)
-def get_machine_type_details(machine_type, zone, project_id):
-    # Try to describe standard type
-    vcpu = "?"
-    ram_gb = "?"
-    try:
-        cmd_mt = [
-            "gcloud", "compute", "machine-types", "describe", machine_type,
-            f"--zone={zone}",
-            f"--project={project_id}",
-            "--format=json"
-        ]
-        mt_json = subprocess.check_output(cmd_mt, text=True, stderr=subprocess.DEVNULL).strip()
-        mt_data = json.loads(mt_json)
-        vcpu = mt_data.get("guestCpus", "?")
-        memory_mb = mt_data.get("memoryMb", 0)
-        ram_gb = f"{memory_mb / 1024:.1f}" if memory_mb else "?"
-    except Exception:
-        # Fallback for custom types (e.g. n2-custom-2-4096)
-        # Format: <family>-custom-<vcpus>-<mem_mb>
-        import re
-        match = re.search(r".*-custom-(\d+)-(\d+)", machine_type)
-        if match:
-             vcpu = match.group(1)
-             memory_mb = int(match.group(2))
-             ram_gb = f"{memory_mb / 1024:.1f}"
-    
-    return vcpu, ram_gb
+async def start_instance(instance_name):
+    """Starts a specific GCE instance."""
+    if instance_name == "all":
+        # We could implement 'all' easily now, but sticking to single for safety first
+        # Or maybe implementing 'all' since it's requested?
+        # Let's support 'all' for "Wow" factor if easy.
+        # But wait, starting ALL might be dangerous. Let's keep it safe.
+        return "Please specify an instance name. Bulk actions are restricted for safety."
 
-def get_instance_recommendations(project, zone, instance_name):
+    try:
+        client = get_instances_client()
+        op_client = get_zone_operations_client()
+
+        request = compute_v1.StartInstanceRequest(
+            project=PROJECT_ID,
+            zone=ZONE,
+            instance=instance_name
+        )
+
+        operation = await asyncio.to_thread(client.start, request)
+        
+        # Wait for operation (optional, but good for feedback)
+        # This might take time, so maybe we just return "Starting..."
+        # But user likes "Completed" feedback.
+        # Let's wait up to 5 seconds, else return "In Progress".
+        
+        # Actually, let's wait for result using the operation client
+        # await asyncio.to_thread(operation.result, timeout=60) # This blocks thread
+        
+        return f"Instance '{instance_name}' start triggered successfully. Status: {operation.status}"
+    except Exception as e:
+        logger.error(f"Error starting instance {instance_name}: {e}")
+        return f"Error starting instance '{instance_name}': {e}"
+
+async def stop_instance(instance_name):
+    """Stops a specific GCE instance."""
+    if instance_name == "all":
+         return "Please specify an instance name. Bulk actions are restricted for safety."
+
+    try:
+        client = get_instances_client()
+        
+        request = compute_v1.StopInstanceRequest(
+            project=PROJECT_ID,
+            zone=ZONE,
+            instance=instance_name
+        )
+
+        operation = await asyncio.to_thread(client.stop, request)
+        return f"Instance '{instance_name}' stop triggered successfully. Status: {operation.status}"
+    except Exception as e:
+        logger.error(f"Error stopping instance {instance_name}: {e}")
+        return f"Error stopping instance '{instance_name}': {e}"
+
+def get_machine_type_details_sync(machine_type_url, zone, project_id):
+    # machine_type_url e.g. https://www.googleapis.com/compute/v1/projects/.../zones/.../machineTypes/e2-micro
+    # or just 'e2-micro'
+    # We need to parse or describe.
+    
+    short_type = machine_type_url.split("/")[-1]
+    
+    # Check for custom type First
+    import re
+    match = re.search(r".*-custom-(\d+)-(\d+)", short_type)
+    if match:
+        vcpu = match.group(1)
+        memory_mb = int(match.group(2))
+        return vcpu, f"{memory_mb / 1024:.1f}"
+
+    try:
+        # Use MachinesClient? Or just hardcode common ones? 
+        # API call is safer.
+        client = compute_v1.MachineTypesClient()
+        request = compute_v1.GetMachineTypeRequest(
+            project=project_id,
+            zone=zone,
+            machine_type=short_type
+        )
+        mt = client.get(request=request)
+        return str(mt.guest_cpus), f"{mt.memory_mb / 1024:.1f}"
+    except Exception:
+        return "?", "?"
+
+async def get_instance_recommendations(project, zone, instance_name):
     """
-    Fetches sizing recommendations and estimated savings.
-    Returns: (recommendation_text, savings_usd)
+    Fetches sizing recommendations.
     """
     rec_text = "None"
     savings = "0.00"
     
     try:
-        # Check MachineTypeRecommender
-        cmd = [
-            "gcloud", "recommender", "recommendations", "list",
-            f"--project={project}",
-            f"--location={zone}",
-            f"--recommender=google.compute.instance.MachineTypeRecommender",
-            "--format=json"
-        ]
-        output = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).strip()
-        recs = json.loads(output)
+        client = get_recommender_client()
+        parent = f"projects/{project}/locations/{zone}/recommenders/google.compute.instance.MachineTypeRecommender"
         
-        for r in recs:
-            # Filter for specific instance (target resource contains instance name)
-            if f"/instances/{instance_name}" in r.get("content", {}).get("operationGroups", [{}])[0].get("operations", [{}])[0].get("resource", ""):
-                description = r.get("description", "")
-                rec_text = description
+        # List recommendations
+        request = recommender_v1.ListRecommendationsRequest(parent=parent)
+        
+        # Wrap sync call
+        page_result = await asyncio.to_thread(client.list_recommendations, request)
+        
+        for r in page_result:
+            # Target resource: //compute.googleapis.com/projects/.../zones/.../instances/NAME
+            if f"/instances/{instance_name}" in r.content.operation_groups[0].operations[0].resource:
+                rec_text = r.description
                 
                 # Calculate savings
-                cost = r.get("primaryImpact", {}).get("costProjection", {}).get("cost", {})
-                if cost.get("currencyCode") == "USD":
-                    units = int(cost.get("units", "0"))
-                    nanos = cost.get("nanos", 0)
-                    total = abs(units + (nanos / 1e9)) # Savings are usually negative
-                    savings = f"{total:.2f}"
+                cost = r.primary_impact.cost_projection.cost
+                if cost.currency_code == "USD":
+                     units = cost.units
+                     nanos = cost.nanos
+                     total = abs(units + (nanos / 1e9))
+                     savings = f"{total:.2f}"
                 break
-                
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Error fetching recommendations: {e}")
         pass
         
     return rec_text, savings
 
-def get_instance_report(instance_name="all"):
+async def get_instance_report(instance_name="all"):
     """
-    Generates a detailed report for a specific instance or all instances.
-    Args:
-        instance_name: Name of the instance, or 'all' for all instances.
+    Generates a detailed report using native Python client.
     """
-    target_name = instance_name if instance_name and instance_name != "all" else None
-    
-    cmd = [
-        "gcloud", "compute", "instances", "describe" if target_name else "list",
-        f"--zone={ZONE}" if target_name else f"--filter=zone:({ZONE})",
-        f"--project={PROJECT_ID}",
-        "--format=json"
-    ]
-    
-    if target_name:
-        cmd.insert(4, target_name) # Insert name after 'describe'
-
     try:
-        output = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).strip()
-        data = json.loads(output)
+        client = get_instances_client()
+        request = compute_v1.ListInstancesRequest(project=PROJECT_ID, zone=ZONE)
         
-        # If describe, wrap in list to reuse logic
-        if isinstance(data, dict):
-            data = [data]
+        # Fetch all efficiently
+        all_instances = await asyncio.to_thread(client.list, request)
         
+        # Filter if single
+        target_list = []
+        for inst in all_instances:
+            if instance_name == "all" or inst.name == instance_name:
+                target_list.append(inst)
+        
+        if not target_list and instance_name != "all":
+            return f"Instance '{instance_name}' not found."
+
         report_lines = []
-        # Add Header Summary
         report_lines.append("=" * 50)
         report_lines.append(f" PROJECT: {PROJECT_ID}")
-        report_lines.append(f" TOTAL INSTANCES: {len(data)}")
+        report_lines.append(f" TOTAL INSTANCES: {len(target_list)}")
         report_lines.append("=" * 50)
-        report_lines.append("") # Spacing
+        report_lines.append("")
 
-        for info in data:
-            name = info.get("name", "Unknown")
-            status = info.get("status", "Turned Off/Unknown")
-            creation_ts = info.get("creationTimestamp", "Unknown")
-            machine_type_url = info.get("machineType", "")
-            machine_type = machine_type_url.split("/")[-1] if "/" in machine_type_url else machine_type_url
+        for inst in target_list:
+            # Basic Info
+            name = inst.name
+            status = inst.status
+            creation_ts = inst.creation_timestamp
             
-            # Fetch VCPU/RAM details
-            vcpu, ram_gb = get_machine_type_details(machine_type, ZONE, PROJECT_ID)
+            # Machine Type
+            mt_url = inst.machine_type
+            short_mt = mt_url.split("/")[-1]
+            
+            # Async fetch details (or sync in thread)? 
+            # We are already in async, but `get_machine_type_details_sync` uses a client.
+            # Doing it sequentially for now inside this thread wrapper? 
+            # Actually we can't await inside the list comprehension easily if we use `await asyncio.to_thread` for the whole block.
+            # Warning: calling sync API here might block the loop if not careful.
+            # But we are inside `async def`, so we should use `await asyncio.to_thread`.
+            
+            vcpu, ram_gb = await asyncio.to_thread(get_machine_type_details_sync, short_mt, ZONE, PROJECT_ID)
             
             # Networking
             priv_ip = "N/A"
             pub_ip = "N/A"
-            network_interfaces = info.get("networkInterfaces", [])
-            if network_interfaces:
-                nic0 = network_interfaces[0]
-                priv_ip = nic0.get("networkIP", "N/A")
-                if nic0.get("accessConfigs"):
-                     pub_ip = nic0["accessConfigs"][0].get("natIP", "N/A")
+            if inst.network_interfaces:
+                nic0 = inst.network_interfaces[0]
+                priv_ip = nic0.network_i_p
+                if nic0.access_configs:
+                    pub_ip = nic0.access_configs[0].nat_i_p
             
             # Disks
-            disks = info.get("disks", [])
+            disks = inst.disks
             total_disk_gb = 0
             disk_details = []
             os_name = "Unknown"
             
             for d in disks:
-                 sz = int(d.get("diskSizeGb", "0"))
-                 total_disk_gb += sz
-                 kind = "Boot" if d.get("boot") else "Data"
-                 disk_details.append(f"{kind} {sz}GB")
-                 
-                 # Try to guess OS from licenses on boot disk
-                 if d.get("boot") and d.get("licenses"):
-                     for lic in d.get("licenses"):
-                         # License URL format: .../global/licenses/<license-name>
-                         # We want to extract <license-name> and format it nicely
-                         if "debian" in lic or "rhel" in lic or "centos" in lic or "ubuntu" in lic or "windows" in lic or "sles" in lic:
-                             parts = lic.split("/")
-                             license_name = parts[-1]
-                             # Formatting: debian-11-bullseye -> Debian 11 Bullseye
+                sz = d.disk_size_gb
+                total_disk_gb += sz
+                kind = "Boot" if d.boot else "Data"
+                disk_details.append(f"{kind} {sz}GB")
+                
+                if d.boot and d.licenses:
+                    for lic in d.licenses:
+                        # License URL
+                        parts = lic.split("/")
+                        license_name = parts[-1]
+                        if any(x in lic for x in ["debian", "rhel", "centos", "ubuntu", "windows", "sles"]):
                              os_name = license_name.replace("-", " ").title()
-                             # Shorten common prefixes if redundant
-                             if os_name.startswith("Debian ") or os_name.startswith("Rhel ") or os_name.startswith("Ubuntu ") or os_name.startswith("Centos "):
-                                 pass # Already good
-                             elif "Windows" in os_name:
-                                 pass # Windows serv...
                              break
-
+            
             # Recommendations
-            rec_text, savings = get_instance_recommendations(PROJECT_ID, ZONE, name)
-
+            rec_text, savings = await get_instance_recommendations(PROJECT_ID, ZONE, name)
+            
             report_lines.append(f"Instance Name:           {name}")
             report_lines.append(f"Project ID:              {PROJECT_ID}")
             report_lines.append(f"Instance Status:         {status}")
             report_lines.append(f"Creation Timestamp:      {creation_ts}")
-            report_lines.append(f"Machine Type:            {machine_type}")
+            report_lines.append(f"Machine Type:            {short_mt}")
             report_lines.append(f"Number of vCPUs:         {vcpu}")
             report_lines.append(f"RAM (GB):                {ram_gb}")
             report_lines.append(f"Total Disk Size (GB):    {total_disk_gb} ({len(disks)} disks: {', '.join(disk_details)})")
@@ -242,57 +273,15 @@ def get_instance_report(instance_name="all"):
             report_lines.append(f"Sizing Recommendations:  {rec_text}")
             report_lines.append(f"Estimated Monthly Savings (USD): ${savings}")
             report_lines.append("-" * 50)
-            report_lines.append("") # Empty line between intances
+            report_lines.append("")
 
         return "\n".join(report_lines)
 
     except Exception as e:
+        logger.error(f"Error generating report: {e}")
         return f"Error generating report: {e}"
 
-async def start_instance(instance_name):
-    """Starts a specific GCE instance."""
-    if instance_name == "all":
-         # TODO: Handle 'all' logic if needed, for now restrict or iterate
-         return "Updating 'all' instances is not yet supported in this function."
-
-    cmd = [
-        "gcloud", "compute", "instances", "start", instance_name,
-        f"--zone={ZONE}",
-        f"--project={PROJECT_ID}",
-        "--format=json"
-    ]
-    try:
-        output = await asyncio.to_thread(
-            lambda: subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT).strip()
-        )
-        # Parse simplified output?
-        return f"Instance '{instance_name}' started successfully.\nDetails: {output[:200]}..."
-    except subprocess.CalledProcessError as e:
-        return f"Error starting instance '{instance_name}': {e.output}"
-    except Exception as e:
-        return f"Unexpected error starting instance: {e}"
-
-async def stop_instance(instance_name):
-    """Stops a specific GCE instance."""
-    if instance_name == "all":
-         return "Updating 'all' instances is not yet supported in this function."
-
-    cmd = [
-        "gcloud", "compute", "instances", "stop", instance_name,
-        f"--zone={ZONE}",
-        f"--project={PROJECT_ID}",
-        "--format=json"
-    ]
-    try:
-        output = await asyncio.to_thread(
-            lambda: subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT).strip()
-        )
-        return f"Instance '{instance_name}' stopped successfully.\nDetails: {output[:200]}..."
-    except subprocess.CalledProcessError as e:
-        return f"Error stopping instance '{instance_name}': {e.output}"
-    except Exception as e:
-        return f"Unexpected error stopping instance: {e}"
-
+# Keeping legacy create_custom_instance using gcloud for now (Complex parameters)
 async def create_custom_instance(name, machine_type="n2-custom-2-4096", image_family="rhel-9", boot_disk_size="10", extra_disk_size="0"):
     """
     Creates a new custom instance.

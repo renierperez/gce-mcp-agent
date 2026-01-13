@@ -4,3 +4,5 @@ httpx
 fastapi
 uvicorn
 firebase-admin
+google-cloud-compute
+google-cloud-recommender

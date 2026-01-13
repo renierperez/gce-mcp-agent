@@ -9,3 +9,5 @@ output.txt
 
 # Firebase Config (Secrets)
 frontend/lib/firebase_config.dart
+.DS_Store
+frontend/.DS_Store

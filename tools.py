@@ -140,8 +140,27 @@ async def list_instances(project_id: str = None):
 
     return "\n\n".join(all_summaries)
 
-async def start_instance(instance_name: str, project_id: str = None):
-    """Starts a specific GCE instance."""
+async def find_instance_zone(project_id: str, instance_name: str) -> Optional[str]:
+    """Finds the zone of a GCE instance using AggregatedList."""
+    try:
+        client = get_instances_client()
+        # Filter strictly by name to get fast result
+        request = compute_v1.AggregatedListInstancesRequest(
+            project=project_id,
+            filter=f"name eq {instance_name}"
+        )
+        agg_list = await asyncio.to_thread(client.aggregated_list, request)
+        
+        for zone_path, response in agg_list:
+            if response.instances:
+                # zone_path format: 'projects/PROJECT/zones/ZONE'
+                return zone_path.split("/")[-1]
+    except Exception as e:
+        logger.error(f"Error finding zone for {instance_name}: {e}")
+    return None
+
+async def start_instance(instance_name: str, project_id: str = None, zone: str = None):
+    """Starts a specific GCE instance. Auto-detects zone if not provided."""
     if instance_name == "all":
         return "Please specify an instance name. Bulk actions are restricted for safety."
 
@@ -150,21 +169,29 @@ async def start_instance(instance_name: str, project_id: str = None):
     except ValueError as e:
         return str(e)
 
+    target_zone = zone
+    if not target_zone:
+        target_zone = await find_instance_zone(resolved_project, instance_name)
+        if not target_zone:
+             # Fallback to default if not found (though likely won't work if it's not there)
+             # Or better, fail fast.
+             return f"Instance '{instance_name}' not found in project '{resolved_project}' (checked all zones)."
+    
     try:
         client = get_instances_client()
         request = compute_v1.StartInstanceRequest(
             project=resolved_project,
-            zone=ZONE,
+            zone=target_zone,
             instance=instance_name
         )
         operation = await asyncio.to_thread(client.start, request)
-        return f"Instance '{instance_name}' (Project: {resolved_project}) start triggered. Status: {operation.status}"
+        return f"Instance '{instance_name}' (Project: {resolved_project}, Zone: {target_zone}) start triggered. Status: {operation.status}"
     except Exception as e:
         logger.error(f"Error starting instance {instance_name}: {e}")
         return f"Error starting instance '{instance_name}': {e}"
 
-async def stop_instance(instance_name: str, project_id: str = None):
-    """Stops a specific GCE instance."""
+async def stop_instance(instance_name: str, project_id: str = None, zone: str = None):
+    """Stops a specific GCE instance. Auto-detects zone if not provided."""
     if instance_name == "all":
          return "Please specify an instance name. Bulk actions are restricted for safety."
 
@@ -173,15 +200,21 @@ async def stop_instance(instance_name: str, project_id: str = None):
     except ValueError as e:
         return str(e)
 
+    target_zone = zone
+    if not target_zone:
+        target_zone = await find_instance_zone(resolved_project, instance_name)
+        if not target_zone:
+             return f"Instance '{instance_name}' not found in project '{resolved_project}' (checked all zones)."
+
     try:
         client = get_instances_client()
         request = compute_v1.StopInstanceRequest(
             project=resolved_project,
-            zone=ZONE,
+            zone=target_zone,
             instance=instance_name
         )
         operation = await asyncio.to_thread(client.stop, request)
-        return f"Instance '{instance_name}' (Project: {resolved_project}) stop triggered. Status: {operation.status}"
+        return f"Instance '{instance_name}' (Project: {resolved_project}, Zone: {target_zone}) stop triggered. Status: {operation.status}"
     except Exception as e:
         logger.error(f"Error stopping instance {instance_name}: {e}")
         return f"Error stopping instance '{instance_name}': {e}"

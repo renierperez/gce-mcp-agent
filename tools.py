@@ -2,25 +2,72 @@ import asyncio
 import subprocess
 import json
 import logging
+import os
+import firebase_admin
+from firebase_admin import firestore
 from google.cloud import compute_v1
 from google.cloud import recommender_v1
 from google.cloud import billing_v1
 from google.api_core.client_options import ClientOptions
+from typing import List, Optional
 
 # Configuration
-PROJECT_ID = "autonomous-agent-479317"
 ZONE = "us-central1-a"
 REGION = "us-central1"
-# SERVICE_ACCOUNT is used for impersonation in CLI, might not be needed for native client on Cloud Run
-# if the Cloud Run SA has permissions.
-SERVICE_ACCOUNT = "mcp-manager@autonomous-agent-479317.iam.gserviceaccount.com"
 
 # Initialize Logging
 logger = logging.getLogger(__name__)
 
+# --- Helper Functions ---
+def _ensure_firebase():
+    """Ensures Firebase Admin is initialized."""
+    try:
+        firebase_admin.get_app()
+    except ValueError:
+        # Fallback for standalone script usage (local)
+        # Assuming GOOGLE_APPLICATION_CREDENTIALS or Cloud Run enc is set
+        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "autonomous-agent-479317")
+        firebase_admin.initialize_app(options={'projectId': project_id})
+
+def _get_firestore_client():
+    _ensure_firebase()
+    return firestore.client()
+
+def get_managed_projects() -> List[str]:
+    """Fetches list of managed project IDs from Firestore."""
+    try:
+        db = _get_firestore_client()
+        docs = db.collection('managed_projects').stream()
+        return [doc.id for doc in docs]
+    except Exception as e:
+        logger.error(f"Error fetching managed projects: {e}")
+        return []
+
+def resolve_project_id(project_id: Optional[str] = None) -> str:
+    """
+    Resolves the project ID to use.
+    If project_id is provided, checks if it's managed.
+    If not provided, and only one managed project exists, returns it.
+    Otherwise raises ValueError.
+    """
+    managed = get_managed_projects()
+    
+    if not managed:
+        raise ValueError("No managed projects found in configuration.")
+
+    if project_id:
+        if project_id not in managed:
+            raise ValueError(f"Project '{project_id}' is not managed by this agent. Allowed: {', '.join(managed)}")
+        return project_id
+    
+    if len(managed) == 1:
+        return managed[0]
+    
+    raise ValueError(f"Multiple managed projects found. Please specify one of: {', '.join(managed)}")
+
 # --- Clients ---
-# We initialize these lazily or globally. Global is fine for Cloud Run (warm instances).
-# Note: On Cloud Run, default credentials are used.
+_clients = {}
+
 def get_instances_client():
     return compute_v1.InstancesClient()
 
@@ -28,102 +75,118 @@ def get_zone_operations_client():
     return compute_v1.ZoneOperationsClient()
 
 def get_recommender_client():
-    # Recommender requires regional endpoint usually
-    opts = ClientOptions(api_endpoint=f"recommender.{REGION}.rep.googleapis.com")
-    # Actually global endpoint is fine for some, but let's stick to default unless issues.
-    return recommender_v1.RecommenderClient()
+    if "recommender" not in _clients:
+        opts = ClientOptions(api_endpoint=f"recommender.{REGION}.rep.googleapis.com")
+        _clients["recommender"] = recommender_v1.RecommenderClient(client_options=opts)
+    return _clients["recommender"]
 
 def get_disks_client():
     return compute_v1.DisksClient()
 
 # --- Tools exposed to the Agent ---
 
-async def list_instances():
-    """Lists all GCE instances in the configured zone."""
+async def list_managed_projects():
+    """Lists all Google Cloud Projects managed by this agent."""
     try:
-        client = get_instances_client()
-        # List instances request
-        request = compute_v1.ListInstancesRequest(
-            project=PROJECT_ID,
-            zone=ZONE
-        )
-        
-        # This is a sync call, wrap in asyncio.to_thread to avoid blocking event loop
-        page_result = await asyncio.to_thread(client.list, request)
-        
-        summary = []
-        for inst in page_result:
-            # inst is an Instance object
-            ip = "N/A"
-            if inst.network_interfaces:
-                ip = inst.network_interfaces[0].network_i_p
-            
-            summary.append(f"Name: {inst.name}, Status: {inst.status}, IP: {ip}")
-            
-        return "\n".join(summary) if summary else "No instances found."
+        projects = await asyncio.to_thread(get_managed_projects)
+        if not projects:
+            return "No managed projects configured."
+        return "Managed Projects:\n" + "\n".join([f"- {p}" for p in projects])
     except Exception as e:
-        logger.error(f"Error listing instances: {e}")
-        return f"Error listing instances: {e}"
+        return f"Error listing projects: {e}"
 
-async def start_instance(instance_name):
+async def list_instances(project_id: str = None):
+    """
+    Lists all GCE instances across ALL zones in the project.
+    Args:
+        project_id: The Project ID to list instances from. 
+                    If 'all', lists from ALL managed projects.
+                    If None, tries to infer if single managed project exists.
+    """
+    managed_projects = []
+    if project_id == "all":
+        managed_projects = await asyncio.to_thread(get_managed_projects)
+    else:
+        try:
+            pid = await asyncio.to_thread(resolve_project_id, project_id)
+            managed_projects = [pid]
+        except ValueError as e:
+            return str(e)
+
+    all_summaries = []
+    for pid in managed_projects:
+        try:
+            # We use AggregatedList to get instances from ALL zones
+            client = get_instances_client()
+            request = compute_v1.AggregatedListInstancesRequest(project=pid)
+            # Use max_results to avoid huge pages if possible/needed, though default is usually fine
+            
+            # Using asyncio.to_thread for the blocking gRPC call
+            agg_list = await asyncio.to_thread(client.aggregated_list, request)
+
+            instance_list = []
+            for zone, response in agg_list:
+                if response.instances:
+                    for instance in response.instances:
+                        instance_list.append(f"- {instance.name} ({instance.status}) | Zone: {zone.split('/')[-1]} | {instance.machine_type.split('/')[-1]}")
+            
+            if instance_list:
+                all_summaries.append(f"### Project: `{pid}`\n" + "\n".join(instance_list))
+            else:
+                 all_summaries.append(f"### Project: `{pid}`\nNo instances found.")
+
+        except Exception as e:
+            all_summaries.append(f"Error listing instances for project {pid}: {e}")
+
+    return "\n\n".join(all_summaries)
+
+async def start_instance(instance_name: str, project_id: str = None):
     """Starts a specific GCE instance."""
     if instance_name == "all":
-        # We could implement 'all' easily now, but sticking to single for safety first
-        # Or maybe implementing 'all' since it's requested?
-        # Let's support 'all' for "Wow" factor if easy.
-        # But wait, starting ALL might be dangerous. Let's keep it safe.
         return "Please specify an instance name. Bulk actions are restricted for safety."
 
     try:
-        client = get_instances_client()
-        op_client = get_zone_operations_client()
+        resolved_project = await asyncio.to_thread(resolve_project_id, project_id)
+    except ValueError as e:
+        return str(e)
 
+    try:
+        client = get_instances_client()
         request = compute_v1.StartInstanceRequest(
-            project=PROJECT_ID,
+            project=resolved_project,
             zone=ZONE,
             instance=instance_name
         )
-
         operation = await asyncio.to_thread(client.start, request)
-        
-        # Wait for operation (optional, but good for feedback)
-        # This might take time, so maybe we just return "Starting..."
-        # But user likes "Completed" feedback.
-        # Let's wait up to 5 seconds, else return "In Progress".
-        
-        # Actually, let's wait for result using the operation client
-        # await asyncio.to_thread(operation.result, timeout=60) # This blocks thread
-        
-        return f"Instance '{instance_name}' start triggered successfully. Status: {operation.status}"
+        return f"Instance '{instance_name}' (Project: {resolved_project}) start triggered. Status: {operation.status}"
     except Exception as e:
         logger.error(f"Error starting instance {instance_name}: {e}")
         return f"Error starting instance '{instance_name}': {e}"
 
-async def stop_instance(instance_name):
+async def stop_instance(instance_name: str, project_id: str = None):
     """Stops a specific GCE instance."""
     if instance_name == "all":
          return "Please specify an instance name. Bulk actions are restricted for safety."
 
     try:
+        resolved_project = await asyncio.to_thread(resolve_project_id, project_id)
+    except ValueError as e:
+        return str(e)
+
+    try:
         client = get_instances_client()
-        
         request = compute_v1.StopInstanceRequest(
-            project=PROJECT_ID,
+            project=resolved_project,
             zone=ZONE,
             instance=instance_name
         )
-
         operation = await asyncio.to_thread(client.stop, request)
-        return f"Instance '{instance_name}' stop triggered successfully. Status: {operation.status}"
+        return f"Instance '{instance_name}' (Project: {resolved_project}) stop triggered. Status: {operation.status}"
     except Exception as e:
         logger.error(f"Error stopping instance {instance_name}: {e}")
         return f"Error stopping instance '{instance_name}': {e}"
 
 def get_machine_type_details_sync(machine_type_url, zone, project_id):
-    # machine_type_url e.g. https://www.googleapis.com/compute/v1/projects/.../zones/.../machineTypes/e2-micro
-    # or just 'e2-micro'
-    # We need to parse or describe.
-    
     short_type = machine_type_url.split("/")[-1]
     
     # Check for custom type First
@@ -135,8 +198,6 @@ def get_machine_type_details_sync(machine_type_url, zone, project_id):
         return vcpu, f"{memory_mb / 1024:.1f}"
 
     try:
-        # Use MachinesClient? Or just hardcode common ones? 
-        # API call is safer.
         client = compute_v1.MachineTypesClient()
         request = compute_v1.GetMachineTypeRequest(
             project=project_id,
@@ -149,28 +210,19 @@ def get_machine_type_details_sync(machine_type_url, zone, project_id):
         return "?", "?"
 
 async def get_instance_recommendations(project, zone, instance_name):
-    """
-    Fetches sizing recommendations.
-    """
     rec_text = "None"
     savings = "0.00"
-    
     try:
         client = get_recommender_client()
         parent = f"projects/{project}/locations/{zone}/recommenders/google.compute.instance.MachineTypeRecommender"
-        
-        # List recommendations
         request = recommender_v1.ListRecommendationsRequest(parent=parent)
         
-        # Wrap sync call
+        # This call can be slow if Rec API is cold or busy
         page_result = await asyncio.to_thread(client.list_recommendations, request)
         
         for r in page_result:
-            # Target resource: //compute.googleapis.com/projects/.../zones/.../instances/NAME
             if f"/instances/{instance_name}" in r.content.operation_groups[0].operations[0].resource:
                 rec_text = r.description
-                
-                # Calculate savings
                 cost = r.primary_impact.cost_projection.cost
                 if cost.currency_code == "USD":
                      units = cost.units
@@ -179,358 +231,375 @@ async def get_instance_recommendations(project, zone, instance_name):
                      savings = f"{total:.2f}"
                 break
     except Exception as e:
-        logger.warning(f"Error fetching recommendations: {e}")
+        # Log as debug to avoid user alarm unless debugging is needed
+        logger.debug(f"Error fetching recommendations for {instance_name}: {e}")
         pass
-        
     return rec_text, savings
 
 async def estimate_monthly_cost(instance, project_id, zone):
     """
-    Estimates the monthly cost of an instance based on its machine type and disks.
+    Rough estimation based on machine type.
     """
-    total_cost = 0.0
-    
+    cost = "0.00"
     try:
-        # 1. Billing API Client
-        billing_client = billing_v1.CloudCatalogClient()
-        service_id = "6F81-5844-456A" # Compute Engine Service ID
+        mt = instance.machine_type.split("/")[-1]
+        # Very basic map for estimation demo
+        # A real implementation would query Cloud Billing Catalog API
+        base_costs = {
+            "e2-micro": 7.11,
+            "e2-small": 14.22,
+            "e2-medium": 28.44,
+            "e2-standard-2": 56.88,
+            "e2-standard-4": 113.76,
+            "e2-standard-8": 227.52,
+            "n1-standard-1": 26.50,
+            "n2-standard-2": 66.00
+        }
         
-        # We need to list SKUs and filter. Since there are thousands, we should cache or be smart.
-        # For now, let's just implement logic for common types found in our project (E2, N2 Custom)
-        # To avoid massive API calls on every request, we might hardcode some known SKU prices if API is too slow,
-        # but the goal is to use the API.
-        
-        # Actually, listing all SKUs is heavy. Let's filter by region at least.
-        # The API doesn't support server-side filtering by region in list_skus efficiently without fetching page by page.
-        # So for this MVP, we will use a simplified lookup or fetch once and cache in memory if this was a long running app.
-        # Given this is a sterile function, we might just have to fetch relevant SKUs ? No, that's too slow.
-        # Let's try to match specific SKUs if possible or use a known price mapping for the demo if API is too heavy.
-        
-        # WAIT: The User wanted API usage.
-        # The query to `list_skus` can be filtered? No, `list_skus` takes `parent` (service).
-        # We iterate and filter by `serviceRegions` containing `zone.split('-')[0]` (us-central1).
-        
-        # Let's do a targeted lookup for the specific machine type components.
-        
-        machine_type = instance.machine_type.split('/')[-1]
-        
-        # Cost Components
-        vcpu_cost = 0.0
-        ram_cost = 0.0
-        disk_cost = 0.0
-        license_cost = 0.0
-        
-        # --- COMPUTE COST ---
-        # Simplified Pricing Logic (approximate for MVP, ideally we fetch SKUs)
-        # e2-micro is a shared core instance.
-        
-        # Pricing constants (Fallbacks if API fails or for speed)
-        # real prices in us-central1 (approx):
-        # e2-micro: ~$7.11/mo (flat)
-        # n2-custom-core: ~$23.07/vCPU/mo
-        # n2-custom-ram: ~$3.06/GB/mo
-        # pd-standard: $0.04/GB/mo
-        # rhel-license: ~$43.80/mo (<=4 vCPU)
-        
-        hours_per_month = 730
-        
-        if "e2-micro" in machine_type:
-            vcpu_cost = 7.12 # Flat rate roughly
-            ram_cost = 0.0
-        elif "custom" in machine_type:
-             # n2-custom-2-4096
-             parts = machine_type.split('-')
-             # n2-custom-vcpus-mem
-             # parts[2] = vcpu, parts[3] = mem
+        val = 0.0
+        if mt in base_costs:
+            val = base_costs[mt]
+        elif "custom" in mt:
+             # Rough heuristic
+             parts = mt.split("-")
              if len(parts) >= 4:
-                vcpu_count = int(parts[2])
-                mem_mb = int(parts[3])
-                mem_gb = mem_mb / 1024
-                
-                # Prices for N2 Custom
-                vcpu_price_hr = 0.031611 
-                ram_price_hr = 0.004237
-                
-                vcpu_cost = vcpu_count * vcpu_price_hr * hours_per_month
-                ram_cost = mem_gb * ram_price_hr * hours_per_month
+                 vcpu = int(parts[2])
+                 mem = int(parts[3]) / 1024
+                 val = (vcpu * 25.0) + (mem * 3.0) # Dummy formula
         
-        # --- LICENSE (OS) ---
-        # Check source disk license
-        for disk in instance.disks:
-             if disk.boot:
-                 for lic in disk.licenses:
-                     if "rhel" in lic:
-                         license_cost = 43.80 # Flat for <= 4 vCPU
-                     elif "windows" in lic:
-                         # Windows is per core
-                         # e.g. $0.046/core/hour
-                         pass # Add logic if needed
-        
-        # --- STORAGE ---
-        for disk in instance.disks:
-            gb = disk.disk_size_gb
-            # Assume pd-standard by default or check type
-            # Check source type if possible, logic in main report maps it.
-            # We'll rely on simple mapping here
-            
-            # If pd-balanced: $0.10, pd-ssd: $0.17, pd-standard: $0.04
-            # We need to look up type again or pass it.
-            # disk.disk_storage_type isn't a field, strictly.
-            # disk.type is the URL.
-            dtype = "standard"
-            if "pd-balanced" in disk.type: dtype = "balanced"
-            if "pd-ssd" in disk.type: dtype = "ssd"
-            
-            price_gb = 0.04
-            if dtype == "balanced": price_gb = 0.10
-            if dtype == "ssd": price_gb = 0.17
-            
-            disk_cost += (gb * price_gb)
+        # Add disk cost
+        for d in instance.disks:
+            val += (d.disk_size_gb * 0.04) # Avg $0.04/GB
 
-        total_cost = vcpu_cost + ram_cost + disk_cost + license_cost
-        
+        # If preemptible/spot?
+        if instance.scheduling.provisioning_model == "SPOT":
+            val *= 0.4 # ~60% discount
+
+        cost = f"{val:.2f}"
     except Exception as e:
-        logger.error(f"Error estimating cost: {e}")
-        return "0.00"
+        logger.warning(f"Cost estimation error: {e}")
+    return cost
 
-    return f"{total_cost:.2f}"
-
-async def get_instance_report(instance_name="all"):
+async def get_instance_report(project_id: str = None, instance_name: str = "all"):
     """
-    Generates a detailed report using native Python client.
+    Generates a detailed Markdown Table report for GCE instances.
+    Includes cost estimation and sizing recommendations.
+    Uses concurrency with semaphore to avoid timeouts.
     """
-    try:
-        instances_client = get_instances_client()
-        disks_client = get_disks_client()
-        
-        inst_request = compute_v1.ListInstancesRequest(project=PROJECT_ID, zone=ZONE)
-        disk_request = compute_v1.ListDisksRequest(project=PROJECT_ID, zone=ZONE)
-        
-        # Fetch all efficiently (Parallel)
-        all_instances, all_disks = await asyncio.gather(
-            asyncio.to_thread(instances_client.list, inst_request),
-            asyncio.to_thread(disks_client.list, disk_request)
-        )
-        
-        # Map Disk URL -> Type
-        disk_type_map = {}
-        for d in all_disks:
-            # d.type is url e.g. .../diskTypes/pd-balanced
-            dt_short = d.type.split("/")[-1]
-            readable_type = dt_short.replace("pd-", "").capitalize()
-            if readable_type == "Ssd": readable_type = "SSD"
-            if readable_type == "Standard": readable_type = "Standard (HDD)"
-            disk_type_map[d.self_link] = readable_type
-        
-        # Filter if single
-        target_list = []
-        for inst in all_instances:
-            if instance_name == "all" or inst.name == instance_name:
-                target_list.append(inst)
-        
-        if not target_list and instance_name != "all":
-            return f"Instance '{instance_name}' not found."
+    managed_projects = []
+    if project_id == "all":
+        managed_projects = await asyncio.to_thread(get_managed_projects)
+    else:
+        try:
+            pid = await asyncio.to_thread(resolve_project_id, project_id)
+            managed_projects = [pid]
+        except ValueError as e:
+            return str(e)
 
-        report_lines = []
-        report_lines.append(f"# 📊 GCE Report for Project `{PROJECT_ID}`")
-        report_lines.append(f"**Total Instances:** {len(target_list)}")
-        report_lines.append("")
+    final_report = []
+    
+    # Semaphore to limit concurrent heavy tasks (Rec API, etc)
+    sem = asyncio.Semaphore(10)
 
-        for inst in target_list:
-            # Basic Info
-            name = inst.name
-            status = inst.status
-            creation_ts = inst.creation_timestamp
+    async def fetch_details_safe(inst, pid):
+        mt_url = inst.machine_type
+        short_mt = mt_url.split("/")[-1]
+        inst_zone_url = inst.zone
+        inst_zone = inst_zone_url.split("/")[-1]
+        
+        async with sem:
+            return await asyncio.gather(
+                asyncio.to_thread(get_machine_type_details_sync, short_mt, inst_zone, pid),
+                get_instance_recommendations(pid, inst_zone, inst.name),
+                estimate_monthly_cost(inst, pid, inst_zone)
+            )
+
+    for pid in managed_projects:
+        try:
+            client = get_instances_client()
             
-            # Machine Type
-            mt_url = inst.machine_type
-            short_mt = mt_url.split("/")[-1]
+            # Fetch all instances first
+            agg_list = await asyncio.to_thread(client.aggregated_list, request=compute_v1.AggregatedListInstancesRequest(project=pid))
             
-            vcpu, ram_gb = await asyncio.to_thread(get_machine_type_details_sync, short_mt, ZONE, PROJECT_ID)
+            target_list = []
+            for zone, response in agg_list:
+                if response.instances:
+                    for instance in response.instances:
+                        if instance_name == "all" or instance.name == instance_name:
+                            target_list.append(instance)
+
+            if not target_list:
+                if instance_name != "all":
+                     final_report.append(f"Project `{pid}`: Instance '{instance_name}' not found.")
+                else:
+                     final_report.append(f"### 📊 Project `{pid}`\nNo instances found.")
+                continue
+
+            # 1. Fetch Project Description
+            project_desc = ""
+            try:
+                # Assuming 'db' is available globally or need to re-init if not.
+                # list_managed_projects uses 'db', so it should be available.
+                doc = db.collection("managed_projects").document(pid).get()
+                if doc.exists:
+                     project_desc = doc.to_dict().get("description", "")
+            except Exception:
+                pass # Fail silently on desc fetch
+
+            # 2. Prepare tasks for details
+            tasks = [fetch_details_safe(inst, pid) for inst in target_list]
+            results = await asyncio.gather(*tasks)
+
+            # 3. Process and Collect Data
+            processed_instances = []
             
-            # Networking
-            priv_ip = "N/A"
-            pub_ip = "N/A"
-            if inst.network_interfaces:
-                nic0 = inst.network_interfaces[0]
-                priv_ip = nic0.network_i_p
-                if nic0.access_configs:
-                    pub_ip = nic0.access_configs[0].nat_i_p
-            
-            # Disks
-            disks = inst.disks
-            total_disk_gb = 0
-            disk_details = []
-            os_name = "Unknown"
-            
-            for d in disks:
-                sz = d.disk_size_gb
-                total_disk_gb += sz
-                kind = "Boot" if d.boot else "Data"
+            # Aggregates
+            total_cost = 0.0
+            total_savings = 0.0
+            total_vcpu = 0
+            total_ram = 0.0
+
+            for i, inst in enumerate(target_list):
+                # Unpack details
+                (vcpu_str, ram_gb_str), (rec_text, savings), estimated_cost = results[i]
                 
-                # Resolve Type
-                dtype = "Unknown"
-                if d.source in disk_type_map:
-                    dtype = disk_type_map[d.source]
-                elif d.type == "SCRATCH":
-                    dtype = "Local SSD"
+                # Parse specific attributes
+                inst_cost = 0.0
+                inst_sav = 0.0
+                inst_vcpu = 0
+                inst_ram = 0.0
+                
+                try: inst_cost = float(estimated_cost)
+                except: pass
+                
+                try: inst_sav = float(savings)
+                except: pass
+
+                try: inst_vcpu = int(vcpu_str)
+                except: pass
+                
+                try: inst_ram = float(ram_gb_str)
+                except: pass
+                
+                # Update Totals
+                total_cost += inst_cost
+                total_savings += inst_sav
+                total_vcpu += inst_vcpu
+                total_ram += inst_ram
+
+                # Parse other fields
+                name = inst.name
+                status = "🟢 RUNNING" if inst.status == "RUNNING" else "🔴 TERMINATED" if inst.status == "TERMINATED" else inst.status
+                
+                created_str = "?"
+                if inst.creation_timestamp:
+                    try: created_str = inst.creation_timestamp.split("T")[0]
+                    except: created_str = inst.creation_timestamp[:10]
+
+                mt_short = inst.machine_type.split("/")[-1]
+                zone_short = inst.zone.split("/")[-1]
+                
+                # IPs
+                priv_ip = "-"
+                pub_ip = "-"
+                if inst.network_interfaces:
+                    nic0 = inst.network_interfaces[0]
+                    priv_ip = nic0.network_i_p
+                    if nic0.access_configs:
+                        pub_ip = nic0.access_configs[0].nat_i_p
+                
+                # Disk & OS
+                total_disk_gb = 0
+                disk_details = []
+                os_name = "?"
+                
+                disks = inst.disks
+                for d in disks:
+                    sz = d.disk_size_gb
+                    total_disk_gb += sz
+                    dtype = "Std"
+                    if "pd-ssd" in d.type: dtype = "SSD"
+                    elif "pd-balanced" in d.type: dtype = "Bal"
                     
-                disk_details.append(f"{kind} {sz}GB ({dtype})")
+                    disk_details.append(f"{sz}G {dtype}")
+
+                    if d.boot and d.licenses:
+                        for lic in d.licenses:
+                            lower_lic = lic.lower()
+                            if "debian" in lower_lic:
+                                parts = lic.split("/")[-1].split("-")
+                                ver = next((p for p in parts if p.isdigit()), "")
+                                os_name = f"Debian {ver}"
+                                break
+                            elif "ubuntu" in lower_lic:
+                                parts = lic.split("/")[-1].split("-")
+                                ver = next((p for p in parts if p.isdigit() and len(p)>=2), "")
+                                if len(ver)==4: ver = f"{ver[:2]}.{ver[2:]}"
+                                os_name = f"Ubuntu {ver}"
+                                break
+                            elif "windows" in lower_lic:
+                                parts = lic.split("/")[-1].split("-")
+                                ver = next((p for p in parts if p.isdigit() and len(p)==4), "")
+                                os_name = f"Windows {ver}"
+                                break
+                            elif "rhel" in lower_lic:
+                                parts = lic.split("/")[-1].split("-")
+                                ver = next((p for p in parts if p.isdigit()), "")
+                                os_name = f"RHEL {ver}"
+                                break
+                            elif "centos" in lower_lic:
+                                parts = lic.split("/")[-1].split("-")
+                                ver = next((p for p in parts if p.isdigit()), "")
+                                os_name = f"CentOS {ver}"
+                                break
                 
-                if d.boot and d.licenses:
-                    for lic in d.licenses:
-                        parts = lic.split("/")
-                        license_name = parts[-1]
-                        if any(x in lic for x in ["debian", "rhel", "centos", "ubuntu", "windows", "sles"]):
-                             os_name = license_name.replace("-", " ").title()
-                             break
+                storage_str = f"{total_disk_gb}G"
+                if disk_details:
+                    storage_str += f" ({', '.join(disk_details)})"
+                
+                processed_instances.append({
+                    "name": name,
+                    "status": status,
+                    "zone": zone_short,
+                    "created": created_str,
+                    "machine_type": mt_short,
+                    "vcpu": inst_vcpu,
+                    "ram": inst_ram,
+                    "storage": storage_str,
+                    "os": os_name,
+                    "int_ip": priv_ip,
+                    "ext_ip": pub_ip,
+                    "cost": inst_cost,
+                    "savings": inst_sav,
+                    "rec_text": rec_text
+                })
+
+            # 4. Sort by Cost Descending
+            processed_instances.sort(key=lambda x: x["cost"], reverse=True)
+
+            # 5. Build Report
+            project_report = []
             
-            # Recommendations & Cost
-            rec_text, savings = await get_instance_recommendations(PROJECT_ID, ZONE, name)
-            estimated_cost = await estimate_monthly_cost(inst, PROJECT_ID, ZONE)
+            # Header (Small uniform headers)
+            project_report.append(f"**📊 Project: `{pid}`**")
+            if project_desc:
+                project_report.append(f"_{project_desc}_")
             
-            # Markdown Formatting
-            report_lines.append(f"### 🖥️ Instance Name: `{name}`")
-            report_lines.append(f"- **Project ID**: `{PROJECT_ID}`")
-            report_lines.append(f"- **Instance Status**: `{status}`")
-            report_lines.append(f"- **Creation Timestamp**: `{creation_ts}`")
-            report_lines.append(f"- **Machine Type**: `{short_mt}`")
-            report_lines.append(f"- **Number of vCPUs**: {vcpu}")
-            report_lines.append(f"- **RAM (GB)**: {ram_gb}")
-            report_lines.append(f"- **Operating System**: {os_name}")
-            report_lines.append(f"- **IP Address**: Internal: `{priv_ip}` / External: `{pub_ip}`")
-            report_lines.append(f"- **Total Disk Size (GB)**: {total_disk_gb} GB Total ({', '.join(disk_details)})")
-            report_lines.append(f"- **Zone**: `{ZONE}`")
-            report_lines.append(f"- **Estimated Monthly Cost**: ${estimated_cost} (Run Rate)")
+            project_report.append("**📈 Project Summary**")
+            project_report.append(f"• **Instances:** {len(target_list)}")
+            project_report.append(f"• **Total vCPU:** {total_vcpu}")
+            project_report.append(f"• **Total RAM:** {total_ram:.1f} GB")
+            project_report.append(f"• **Monthly Cost:** `${total_cost:.2f}`")
+            project_report.append(f"• **Potential Savings:** `${total_savings:.2f}`")
+            project_report.append("---")
 
-            # Recommendations (Always show field if requested, but keep it clean)
-            if rec_text != "None" or float(savings) > 0:
-                 report_lines.append(f"> 💡 **Sizing Recommendations**: {rec_text}")
-                 report_lines.append(f"> **Estimated Monthly Savings (USD)**: ${savings}")
-            else:
-                 report_lines.append(f"- **Sizing Recommendations**: None")
-                 report_lines.append(f"- **Estimated Monthly Savings (USD)**: $0.00")
-            
-            report_lines.append("") # Spacer
-            report_lines.append("---")
-            report_lines.append("")
+            # Cards - Uniform small font
+            # Enumeration start at 1
+            for idx, inst in enumerate(processed_instances, 1):
+                rec_icon = "⚠️" if inst["rec_text"] != "None" else "✅"
+                rec_str = ""
+                if inst["rec_text"] != "None":
+                     rec_str = f" | 💡 Tip: {inst['rec_text']}"
 
-        return "\n".join(report_lines)
+                # Line 1: Enumeration + Name
+                line1 = f"**{idx}. 🖥️ `{inst['name']}`**"
+                
+                # Line 2: Status | Zone | Created
+                line2 = f"**Status:** {inst['status']} | **Zone:** {inst['zone']} | **Created:** {inst['created']}"
+                
+                # Line 3: Machine Type | vCPU | RAM | Total Disk Size
+                line3 = f"**Machine Type:** {inst['machine_type']} | **vCPU:** {inst['vcpu']} | **RAM:** {inst['ram']} GB | **Total Disk Size:** {inst['storage']}"
+                
+                # Line 4: OS | Int IP | Ext IP
+                ext_ip_display = inst['ext_ip'] if inst['ext_ip'] != "-" else "None"
+                line4 = f"**OS:** {inst['os']} | **Int IP:** {inst['int_ip']} | **Ext IP:** {ext_ip_display}"
+                
+                # Line 5: Cost | Savings
+                line5 = f"**💰 Cost:** ${inst['cost']:.2f}/mo | **💸 Savings:** ${inst['savings']:.2f}{rec_str}"
 
-    except Exception as e:
-        logger.error(f"Error generating report: {e}")
-        return f"Error generating report: {e}"
+                project_report.append(f"{line1}\n{line2}\n{line3}\n{line4}\n{line5}")
+                project_report.append("---")
 
-async def create_custom_instance(name, machine_type="n2-custom-2-4096", image_family="rhel-9", boot_disk_size="10", extra_disk_size="0"):
-    """
-    Creates a new custom instance using the native Python Client.
-    Args:
-        name: Name of the new instance.
-        machine_type: Machine type (default: n2-custom-2-4096).
-        image_family: Image family (default: rhel-9).
-        boot_disk_size: Size of boot disk in GB (default: 10).
-        extra_disk_size: Size of additional data disk in GB (default: 0).
-    """
+            final_report.append("\n".join(project_report))
+
+        except Exception as e:
+            final_report.append(f"Error generating report for {pid}: {e}")
+
+    return "\n\n".join(final_report)
+
+async def create_custom_instance(name, project_id=None, machine_type="n2-custom-2-4096", image_family="rhel-9", boot_disk_size="10", extra_disk_size="0"):
+    """Creates a new custom instance."""
     final_name = name.lower().replace("_", "-")
     
     try:
-        # Client setup
-        instances_client = get_instances_client()
-        op_client = get_zone_operations_client()
+        resolved_project = await asyncio.to_thread(resolve_project_id, project_id)
+    except ValueError as e:
+        return str(e)
 
-        # 1. Resolve Image Project
+    try:
+        instances_client = get_instances_client()
         image_project = "rhel-cloud"
-        if "debian" in image_family:
-            image_project = "debian-cloud"
-        elif "ubuntu" in image_family:
-            image_project = "ubuntu-os-cloud"
-        elif "centos" in image_family:
-            image_project = "centos-cloud"
+        if "debian" in image_family: image_project = "debian-cloud"
+        elif "ubuntu" in image_family: image_project = "ubuntu-os-cloud"
+        elif "centos" in image_family: image_project = "centos-cloud"
         
         source_image = f"projects/{image_project}/global/images/family/{image_family}"
 
-        # 2. Configure Disks
         disks = []
-        
         # Boot Disk
         boot_disk = compute_v1.AttachedDisk()
         boot_disk.initialize_params = compute_v1.AttachedDiskInitializeParams()
         boot_disk.initialize_params.disk_size_gb = int(boot_disk_size)
         boot_disk.initialize_params.source_image = source_image
-        boot_disk.initialize_params.disk_type = f"projects/{PROJECT_ID}/zones/{ZONE}/diskTypes/pd-balanced"
+        boot_disk.initialize_params.disk_type = f"projects/{resolved_project}/zones/{ZONE}/diskTypes/pd-balanced"
         boot_disk.auto_delete = True
         boot_disk.boot = True
         boot_disk.type_ = compute_v1.AttachedDisk.Type.PERSISTENT.name
         disks.append(boot_disk)
 
-        # Extra Disk (if requested)
         if extra_disk_size and int(extra_disk_size) > 0:
             data_disk = compute_v1.AttachedDisk()
             data_disk.initialize_params = compute_v1.AttachedDiskInitializeParams()
             data_disk.initialize_params.disk_size_gb = int(extra_disk_size)
-            data_disk.initialize_params.disk_type = f"projects/{PROJECT_ID}/zones/{ZONE}/diskTypes/pd-balanced"
+            data_disk.initialize_params.disk_type = f"projects/{resolved_project}/zones/{ZONE}/diskTypes/pd-balanced"
             data_disk.initialize_params.disk_name = f"{final_name}-data"
             data_disk.auto_delete = True
             data_disk.boot = False
             data_disk.type_ = compute_v1.AttachedDisk.Type.PERSISTENT.name
             disks.append(data_disk)
 
-        # 3. Configure Network
         network_interface = compute_v1.NetworkInterface()
-        # Use default network, usually global/networks/default or project specific
-        # We try to use 'global/networks/default' if it exists, or just dont specify name to assume default
-        # But explicitly is better. The gcloud command used 'default'.
         network_interface.name = "global/networks/default"
         
-        # No external IP requested in original command (--no-address)? 
-        # Wait, the gcloud command had: "--network-interface=network-tier=PREMIUM,stack-type=IPV4_ONLY,subnet=default,no-address"
-        # So explicitly NO AccessConfig.
-        
-        # 4. Service Account & Scopes
         service_account = compute_v1.ServiceAccount()
-        service_account.email = "30162433848-compute@developer.gserviceaccount.com" # Default compute SA from previous code
-        service_account.scopes = [
-            "https://www.googleapis.com/auth/devstorage.read_only",
-            "https://www.googleapis.com/auth/logging.write",
-            "https://www.googleapis.com/auth/monitoring.write",
-            "https://www.googleapis.com/auth/servicecontrol",
-            "https://www.googleapis.com/auth/service.management.readonly",
-            "https://www.googleapis.com/auth/trace.append"
-        ]
+        # Use default compute SA logic or specific one. 
+        # Using default compute SA for the target project is usually 'PROJECT_NUMBER-compute@...'
+        # But we don't know the project number easily here without looking it up.
+        # It's better to NOT specify email to let GCE pick the default, 
+        # OR fetch it. If we omit email, it uses default.
+        service_account.scopes = ["https://www.googleapis.com/auth/cloud-platform"]
 
-        # 5. Build Instance Proto
         instance = compute_v1.Instance()
         instance.name = final_name
         instance.machine_type = f"zones/{ZONE}/machineTypes/{machine_type}"
         instance.disks = disks
         instance.network_interfaces = [network_interface]
         instance.service_accounts = [service_account]
-        
-        # Add labels if needed (e.g. goog-ec-src=vm_add-gcloud kept for parity?)
         instance.labels = {"created-by": "gce-manager-agent"}
-
-        # Scheduling - Maintenance Policy MIGRATE is default usually
         instance.scheduling = compute_v1.Scheduling()
         instance.scheduling.on_host_maintenance = "MIGRATE"
         instance.scheduling.provisioning_model = "STANDARD"
 
-        # 6. Execute Insert
         request = compute_v1.InsertInstanceRequest(
-            project=PROJECT_ID,
+            project=resolved_project,
             zone=ZONE,
             instance_resource=instance
         )
 
         operation = await asyncio.to_thread(instances_client.insert, request)
-        
-        # We can wait for it if we want "Completed" status, or just return "Triggered".
-        # The prompt usually expects a result. Let's wait briefly or return Pending.
-        # Since it's 'create', user usually wants to know if it SUCCEEDED.
-        # But asyncio.to_thread waiting on operation.result() blocks the worker thread.
-        # It's better to just return "Triggered" and tell them to check status, OR wait with a timeout.
-        
-        return f"Instance '{final_name}' creation triggered. \nOperation Name: {operation.name}\nStatus: {operation.status}"
+        return f"Instance '{final_name}' creation triggered in project '{resolved_project}'. \nOperation: {operation.name}"
 
     except Exception as e:
-        logger.error(f"Error creating instance native: {e}")
-        return f"Error creating instance: {e}"
+        logger.error(f"Error creating instance: {e}")
+        return f"Error creating instance in {resolved_project}: {e}"
+

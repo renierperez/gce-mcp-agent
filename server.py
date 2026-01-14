@@ -70,19 +70,25 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Security(security))
             
             if not doc.exists:
                  logger.warning(f"Unauthorized access attempt by {email} (Not found in Firestore)")
-                 raise HTTPException(status_code=403, detail="User not authorized")
+                 raise HTTPException(
+                     status_code=403, 
+                     detail="Access Denied: You do not have permission to access the GCE Manager Agent. Please contact the administrator to request access. Once authorized, you will be able to manage GCE instances, estimate monthly costs, and monitor infrastructure directly from this interface."
+                 )
                  
             # Optional: Check for an 'active' field if you want to soft-disable
             if not doc.to_dict().get('active', True):
                  logger.warning(f"Unauthorized access attempt by {email} (User disabled)")
-                 raise HTTPException(status_code=403, detail="User account is disabled")
+                 raise HTTPException(
+                     status_code=403, 
+                     detail="Access Denied: Your account has been temporarily disabled. Please contact the administrator."
+                 )
 
         except HTTPException as he:
             raise he
         except Exception as e:
             # Fallback for connectivity issues or initial setup (allow if Firestore fails? No, fail secure)
             logger.error(f"Firestore Authorization Error: {e}")
-            raise HTTPException(status_code=403, detail="Authorization service unavailable")
+            raise HTTPException(status_code=403, detail="Authorization service unavailable. Please try again later.")
              
         return decoded_token
     except HTTPException as he:
@@ -189,6 +195,29 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(verify_token)):
 
     final_response = "".join(full_response_text)
     return ChatResponse(response=final_response, session_id=session_id)
+
+@app.on_event("startup")
+async def startup_event():
+    """Seeds the managed_projects collection if empty."""
+    try:
+        db = firestore.client()
+        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "autonomous-agent-479317")
+        doc_ref = db.collection('managed_projects').document(project_id)
+        
+        # Check if exists (sync call wrapped or just do it? It's startup, blocking is OK-ish but fast)
+        # Using a transaction or just get/set is fine.
+        doc = doc_ref.get()
+        if not doc.exists:
+            logger.info(f"Seeding 'managed_projects' with {project_id}")
+            doc_ref.set({
+                "project_id": project_id,
+                "name": "Primary Agent Project",
+                "description": "Auto-seeded on startup"
+            })
+        else:
+             logger.info(f"Project {project_id} already managed.")
+    except Exception as e:
+        logger.error(f"Startup seeding failed: {e}")
 
 if __name__ == "__main__":
     import uvicorn

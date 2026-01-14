@@ -40,11 +40,16 @@ class GceManagerApp extends StatelessWidget {
           surface: const Color(0xFF1E1E1E),
         ),
         scaffoldBackgroundColor: const Color(0xFF121212),
-        textTheme: GoogleFonts.outfitTextTheme(
-           Theme.of(context).textTheme.apply(
-             bodyColor: Colors.white,
-             displayColor: Colors.white,
-           ),
+        textTheme: GoogleFonts.interTextTheme(
+          Theme.of(context).textTheme.apply(
+            bodyColor: Colors.white,
+            displayColor: Colors.white,
+          ).copyWith(
+            bodyMedium: const TextStyle(fontSize: 14, fontWeight: FontWeight.w400, color: Colors.white),
+            bodyLarge: const TextStyle(fontSize: 14, fontWeight: FontWeight.w400, color: Colors.white),
+            headlineMedium: const TextStyle(color: Colors.white),
+            titleLarge: const TextStyle(color: Colors.white),
+          ),
         ),
       ),
       home: const AuthWrapper(),

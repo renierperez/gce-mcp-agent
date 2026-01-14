@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter_markdown/flutter_markdown.dart';
+import 'package:google_fonts/google_fonts.dart';
 import 'auth_service.dart';
 
 class ChatScreen extends StatefulWidget {
@@ -61,8 +62,19 @@ class _ChatScreenState extends State<ChatScreen> {
           _messages.add({'role': 'agent', 'content': agentResponse});
         });
       } else {
+        // Try to parse custom error message from backend
+        String errorMsg = 'Error: ${response.statusCode} - ${response.reasonPhrase}';
+        try {
+          final errorData = jsonDecode(response.body);
+          if (errorData['detail'] != null) {
+            errorMsg = errorData['detail'];
+          }
+        } catch (_) {
+          // Keep default message if parsing fails
+        }
+        
         setState(() {
-          _messages.add({'role': 'agent', 'content': 'Error: ${response.statusCode} - ${response.reasonPhrase}'});
+          _messages.add({'role': 'agent', 'content': errorMsg});
         });
       }
     } catch (e) {
@@ -132,31 +144,51 @@ class _ChatScreenState extends State<ChatScreen> {
                     ),
                     decoration: BoxDecoration(
                       color: isUser 
-                          ? Theme.of(context).colorScheme.primary 
-                          : Theme.of(context).colorScheme.surfaceContainerHighest,
-                      borderRadius: BorderRadius.circular(16).copyWith(
+                          ? const Color(0xFF2D2D2D) // Dark Gray for User
+                          : Theme.of(context).colorScheme.surface.withOpacity(0.5), // Subtle transparent/surface
+                      borderRadius: BorderRadius.circular( isUser ? 16 : 12).copyWith(
                         bottomRight: isUser ? Radius.zero : null,
                         bottomLeft: !isUser ? Radius.zero : null,
                       ),
+                      border: isUser ? null : Border.all(color: Colors.grey.withOpacity(0.25), width: 1), // Fine border for card look
                     ),
                     child: isUser
                         ? Text(
                             msg['content']!,
-                            style: TextStyle(color: Theme.of(context).colorScheme.onPrimary),
+                            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                              color: Colors.white, // Force white for user text
+                              height: 1.4,
+                            ),
                           )
                         : MarkdownBody(
                             data: msg['content']!,
                             selectable: true,
-                            styleSheet: MarkdownStyleSheet(
-                              p: TextStyle(color: Theme.of(context).colorScheme.onSurface),
-                              strong: const TextStyle(fontWeight: FontWeight.bold),
-                              code: TextStyle(
-                                backgroundColor: Colors.black26,
+                            styleSheet: MarkdownStyleSheet.fromTheme(Theme.of(context)).copyWith(
+                              p: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                                color: Colors.white, // Force white for report text
+                                height: 1.4,
+                              ),
+                              blockSpacing: 12.0,
+                              strong: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                                fontWeight: FontWeight.w500,
+                                color: Colors.white, // Force white for strong text
+                              ),
+                              h1: const TextStyle(fontWeight: FontWeight.w500, fontSize: 18, color: Colors.white),
+                              h2: const TextStyle(fontWeight: FontWeight.w500, fontSize: 16, color: Colors.white),
+                              h3: const TextStyle(fontWeight: FontWeight.w500, fontSize: 14, color: Colors.white),
+                              code: Theme.of(context).textTheme.bodyMedium?.copyWith(
                                 fontFamily: 'monospace',
+                                fontSize: 12, // Code blocks 12px
+                                color: Colors.grey[300],
+                                backgroundColor: Colors.transparent,
                               ),
                               codeblockDecoration: BoxDecoration(
-                                color: Colors.black26,
+                                color: const Color(0xFF212121),
                                 borderRadius: BorderRadius.circular(8),
+                                border: Border.all(color: Colors.white12),
+                              ),
+                              listBullet: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                                color: Colors.white, // Force white for bullets
                               ),
                             ),
                           ),

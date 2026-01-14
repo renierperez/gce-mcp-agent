@@ -32,6 +32,7 @@ def create_agent():
             tools.get_instance_report,
             tools.start_instance,
             tools.stop_instance,
+            tools.list_managed_projects,
             tools.create_custom_instance
         ],
         instruction=combined_instructions

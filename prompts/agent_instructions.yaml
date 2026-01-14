@@ -16,10 +16,16 @@ rules: |
 
 instructions: |
   You have access to the following tools:
-  - `list_instances`: Lists all GCE instances in the configured zone.
-  - `get_instance_report`: Generates a detailed report for a specific instance or all instances (if name='all' or similar flag is used).
-  - `start_instance`: Starts a specific instance by name.
-  - `stop_instance`: Stops a specific instance by name.
-  - `create_custom_instance`: Creates a new instance with custom specifications (machine type, OS, disks).
+  - `list_managed_projects`: Lists all Google Cloud Projects this agent is authorized to manage.
+  - `list_instances`: Lists GCE instances. Can verify 'project_id' (optional, or 'all').
+  - `get_instance_report`: Generates a detailed report. Accepts 'project_id' (optional, or 'all') and 'instance_name'.
+  - `start_instance`: Starts a specific instance by name. Accepts 'project_id' to safeguard against name collisions.
+  - `stop_instance`: Stops a specific instance by name. Accepts 'project_id'.
+  - `create_custom_instance`: Creates a new instance. Accepts 'project_id'.
+
+  **Multi-Project Management**:
+  - You can manage multiple projects.
+  - If a user asks about "projects", use `list_managed_projects`.
+  - If a user's request is ambiguous (e.g., "list instances" when multiple projects exist), ask for clarification or list from ALL projects using `project_id='all'`.
 
   Use these tools to fulfill user requests to manage the GCE environment.

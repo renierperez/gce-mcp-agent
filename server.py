@@ -8,6 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import firebase_admin
 from firebase_admin import auth, credentials
+import time
+
 from google.adk.runners import Runner
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
 from google.genai import types
@@ -52,6 +54,11 @@ from firebase_admin import auth, credentials, firestore
 
 # ... (Previous code)
 
+
+# Auth Cache: {email: (timestamp, is_allowed)}
+_auth_cache = {}
+AUTH_CACHE_TTL = 300  # 5 minutes
+
 def verify_token(credentials: HTTPAuthorizationCredentials = Security(security)):
     token = credentials.credentials
     try:
@@ -59,6 +66,19 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Security(security))
         decoded_token = auth.verify_id_token(token)
         email = decoded_token.get("email")
         
+        # Check Cache
+        now = time.time()
+        if email in _auth_cache:
+            ts, is_allowed = _auth_cache[email]
+            if now - ts < AUTH_CACHE_TTL:
+                if not is_allowed:
+                     logger.warning(f"Unauthorized access attempt by {email} (Cached Deny)")
+                     raise HTTPException(
+                         status_code=403, 
+                         detail="Access Denied: You do not have permission to access the GCE Manager Agent."
+                     )
+                return decoded_token
+
         # Access Control (Firestore)
         # We check if a document exists with the user's email or if the email is in a trusted list
         try:
@@ -69,6 +89,9 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Security(security))
             doc = user_ref.get()
             
             if not doc.exists:
+                 # Cache the failure
+                 _auth_cache[email] = (now, False)
+                 
                  logger.warning(f"Unauthorized access attempt by {email} (Not found in Firestore)")
                  raise HTTPException(
                      status_code=403, 
@@ -76,12 +99,18 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Security(security))
                  )
                  
             # Optional: Check for an 'active' field if you want to soft-disable
-            if not doc.to_dict().get('active', True):
+            # For simplicity, we assume existence = access for now, or check 'active'
+            user_data = doc.to_dict()
+            if not user_data.get('active', True):
+                 _auth_cache[email] = (now, False)
                  logger.warning(f"Unauthorized access attempt by {email} (User disabled)")
                  raise HTTPException(
                      status_code=403, 
                      detail="Access Denied: Your account has been temporarily disabled. Please contact the administrator."
                  )
+            
+            # Cache the success
+            _auth_cache[email] = (now, True)
 
         except HTTPException as he:
             raise he
@@ -96,6 +125,7 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Security(security))
     except Exception as e:
         logger.error(f"Auth error: {e}")
         raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+
 
 # Setup Environment (Ensure these are set or passed safely)
 if "GOOGLE_CLOUD_PROJECT" not in os.environ:

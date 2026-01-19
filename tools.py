@@ -504,6 +504,7 @@ async def get_instance_report(project_id: str = None, instance_name: str = "all"
             total_savings = 0.0
             total_vcpu = 0
             total_ram = 0.0
+            project_total_disk_gb = 0
 
             for i, inst in enumerate(target_list):
                 # Unpack details
@@ -615,6 +616,8 @@ async def get_instance_report(project_id: str = None, instance_name: str = "all"
                 if disk_details:
                     storage_str += f" ({', '.join(disk_details)})"
                 
+                project_total_disk_gb += total_disk_gb
+                
                 processed_instances.append({
                     "name": name,
                     "status": status,
@@ -647,6 +650,7 @@ async def get_instance_report(project_id: str = None, instance_name: str = "all"
             project_report.append(f"• **Instances:** {len(target_list)}")
             project_report.append(f"• **Total vCPU:** {total_vcpu}")
             project_report.append(f"• **Total RAM:** {total_ram:.1f} GB")
+            project_report.append(f"• **Total Disk Size:** {project_total_disk_gb} GB")
             project_report.append(f"• **Monthly Cost:** `${total_cost:.2f}`")
             project_report.append(f"• **Potential Savings:** `${total_savings:.2f}`")
             project_report.append("---")

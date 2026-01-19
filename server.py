@@ -219,6 +219,10 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Startup seeding failed: {e}")
 
+from google.cloud import recommender_v1
+import re
+
+
 if __name__ == "__main__":
     import uvicorn
     # Listen on all interfaces for Cloud Run (port 8080 default env)

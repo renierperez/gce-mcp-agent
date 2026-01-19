@@ -1,4 +1,5 @@
 import asyncio
+import re
 import subprocess
 import json
 import logging
@@ -76,8 +77,8 @@ def get_zone_operations_client():
 
 def get_recommender_client():
     if "recommender" not in _clients:
-        opts = ClientOptions(api_endpoint=f"recommender.{REGION}.rep.googleapis.com")
-        _clients["recommender"] = recommender_v1.RecommenderClient(client_options=opts)
+        # Use default global endpoint to support all regions
+        _clients["recommender"] = recommender_v1.RecommenderClient()
     return _clients["recommender"]
 
 def get_disks_client():
@@ -245,26 +246,58 @@ def get_machine_type_details_sync(machine_type_url, zone, project_id):
 async def get_instance_recommendations(project, zone, instance_name):
     rec_text = "None"
     savings = "0.00"
+    
+    recommenders = [
+        "google.compute.instance.MachineTypeRecommender",
+        "google.compute.instance.IdleResourceRecommender"
+    ]
+
     try:
         client = get_recommender_client()
-        parent = f"projects/{project}/locations/{zone}/recommenders/google.compute.instance.MachineTypeRecommender"
-        request = recommender_v1.ListRecommendationsRequest(parent=parent)
         
-        # This call can be slow if Rec API is cold or busy
-        page_result = await asyncio.to_thread(client.list_recommendations, request)
-        
-        for r in page_result:
-            if f"/instances/{instance_name}" in r.content.operation_groups[0].operations[0].resource:
-                rec_text = r.description
-                cost = r.primary_impact.cost_projection.cost
-                if cost.currency_code == "USD":
-                     units = cost.units
-                     nanos = cost.nanos
-                     total = abs(units + (nanos / 1e9))
-                     savings = f"{total:.2f}"
-                break
+        for rec_id in recommenders:
+            try:
+                parent = f"projects/{project}/locations/{zone}/recommenders/{rec_id}"
+                request = recommender_v1.ListRecommendationsRequest(parent=parent)
+                
+                # specific check to avoid long waits? usually fast enough.
+                page_result = await asyncio.to_thread(client.list_recommendations, request)
+                
+                for r in page_result:
+                    # Check if this recommendation is for our instance
+                    # We check operation resources 
+                    is_match = False
+                    if r.content.operation_groups:
+                        for op_group in r.content.operation_groups:
+                            for op in op_group.operations:
+                                if f"/instances/{instance_name}" in op.resource:
+                                    is_match = True
+                                    break
+                            if is_match: break
+                    
+                    if is_match:
+                        # Found a recommendation!
+                        # If we already have one, maybe we append? For now, let's take the first significant one or arguably the largest savings.
+                        # Usually simple view: show the first one found.
+                        if rec_text == "None":
+                            rec_text = r.description
+                        else:
+                            rec_text += f" | {r.description}"
+
+                        cost = r.primary_impact.cost_projection.cost
+                        if cost.currency_code == "USD":
+                             units = cost.units
+                             nanos = cost.nanos
+                             total = abs(units + (nanos / 1e9))
+                             current_savings = float(savings)
+                             new_savings = current_savings + total
+                             savings = f"{new_savings:.2f}"
+            except Exception as e:
+                # specific recommender might fail or be empty, continue to next
+                logger.debug(f"Req failed for {rec_id}: {e}")
+                continue
+
     except Exception as e:
-        # Log as debug to avoid user alarm unless debugging is needed
         logger.debug(f"Error fetching recommendations for {instance_name}: {e}")
         pass
     return rec_text, savings
@@ -313,11 +346,78 @@ async def estimate_monthly_cost(instance, project_id, zone):
         logger.warning(f"Cost estimation error: {e}")
     return cost
 
+
+# Pre-compile regex for performance
+RESOURCE_PATTERN = re.compile(r"zones/([^/]+)/instances/([^/]+)")
+
+async def fetch_zone_recommendations(project_id, zone, client, rec_map):
+    """Fetches recommendations for a specific zone and populates rec_map."""
+    recommenders = [
+        "google.compute.instance.MachineTypeRecommender",
+        "google.compute.instance.IdleResourceRecommender"
+    ]
+    
+    for rec_id in recommenders:
+        try:
+            parent = f"projects/{project_id}/locations/{zone}/recommenders/{rec_id}"
+            request = recommender_v1.ListRecommendationsRequest(parent=parent)
+            # Use asyncio to run the sync client method
+            page_result = await asyncio.to_thread(client.list_recommendations, request)
+            
+            for r in page_result:
+                # Calculate savings
+                savings = 0.0
+                if r.primary_impact.cost_projection.cost:
+                    cost = r.primary_impact.cost_projection.cost
+                    if cost.currency_code == "USD":
+                        units = cost.units
+                        nanos = cost.nanos
+                        # Savings are usually negative cost, but we want the absolute magnitude
+                        savings = abs(units + (nanos / 1e9))
+
+                rec_entry = {
+                    "description": r.description,
+                    "savings": savings,
+                    "recommender": rec_id.split(".")[-1]
+                }
+
+                # Map using the unique resource ID
+                # Recommender returns resources like: //compute.googleapis.com/projects/p/zones/z/instances/name
+                # Reference script uses targetResources, which is more reliable than operation_groups for some types.
+                resources_found = []
+                if hasattr(r, "target_resources"):
+                    resources_found.extend(r.target_resources)
+                
+                if not resources_found and r.content.operation_groups:
+                     # Fallback to operation groups if target_resources is empty
+                     for op_group in r.content.operation_groups:
+                            for op in op_group.operations:
+                                resources_found.append(op.resource)
+                
+                # Deduplicate resources to prevent double counting
+                resources_found = list(set(resources_found))
+
+                for resource in resources_found:
+                    # Robust Match: Parse zone and name from URL string using Regex
+                    # Matches "zones/{zone}/instances/{name}" ignoring prefix
+                    match = RESOURCE_PATTERN.search(resource)
+                    if match:
+                        key = f"{match.group(1)}/{match.group(2)}"
+                        logger.info(f"FOUND REC: {rec_id} for {key} -> ${savings}")
+                        if key not in rec_map:
+                            rec_map[key] = []
+                        rec_map[key].append(rec_entry)
+                    else:
+                        logger.warning(f"Failed to parse resource string: {resource}")
+
+        except Exception as e:
+            logger.warning(f"Failed to list recommendations for {zone}/{rec_id}: {e}")
+
 async def get_instance_report(project_id: str = None, instance_name: str = "all"):
     """
     Generates a detailed Markdown Table report for GCE instances.
     Includes cost estimation and sizing recommendations.
-    Uses concurrency with semaphore to avoid timeouts.
+    Uses generic batching for recommendations to be efficient and accurate.
     """
     managed_projects = []
     if project_id == "all":
@@ -331,21 +431,20 @@ async def get_instance_report(project_id: str = None, instance_name: str = "all"
 
     final_report = []
     
-    # Semaphore to limit concurrent heavy tasks (Rec API, etc)
+    # Semaphore for instance details
     sem = asyncio.Semaphore(10)
 
-    async def fetch_details_safe(inst, pid):
+    async def fetch_instances_details_excluding_rec(inst, pid, zone_short):
         mt_url = inst.machine_type
         short_mt = mt_url.split("/")[-1]
-        inst_zone_url = inst.zone
-        inst_zone = inst_zone_url.split("/")[-1]
         
         async with sem:
-            return await asyncio.gather(
-                asyncio.to_thread(get_machine_type_details_sync, short_mt, inst_zone, pid),
-                get_instance_recommendations(pid, inst_zone, inst.name),
-                estimate_monthly_cost(inst, pid, inst_zone)
-            )
+             # Just fetch machine type detailssync and estimate cost
+             # Recommender is handled separately now
+             return await asyncio.gather(
+                 asyncio.to_thread(get_machine_type_details_sync, short_mt, zone_short, pid),
+                 estimate_monthly_cost(inst, pid, zone_short)
+             )
 
     for pid in managed_projects:
         try:
@@ -355,10 +454,14 @@ async def get_instance_report(project_id: str = None, instance_name: str = "all"
             agg_list = await asyncio.to_thread(client.aggregated_list, request=compute_v1.AggregatedListInstancesRequest(project=pid))
             
             target_list = []
-            for zone, response in agg_list:
+            unique_zones = set()
+
+            for zone_path, response in agg_list:
                 if response.instances:
+                    zone_short = zone_path.split("/")[-1]
+                    unique_zones.add(zone_short)
                     for instance in response.instances:
-                        if instance_name == "all" or instance.name == instance_name:
+                         if instance_name == "all" or instance.name == instance_name:
                             target_list.append(instance)
 
             if not target_list:
@@ -371,19 +474,29 @@ async def get_instance_report(project_id: str = None, instance_name: str = "all"
             # 1. Fetch Project Description
             project_desc = ""
             try:
-                # Assuming 'db' is available globally or need to re-init if not.
-                # list_managed_projects uses 'db', so it should be available.
-                doc = db.collection("managed_projects").document(pid).get()
+                # Assuming 'db' is available globally
+                doc = _get_firestore_client().collection("managed_projects").document(pid).get()
                 if doc.exists:
                      project_desc = doc.to_dict().get("description", "")
             except Exception:
-                pass # Fail silently on desc fetch
+                pass 
 
-            # 2. Prepare tasks for details
-            tasks = [fetch_details_safe(inst, pid) for inst in target_list]
+            # 2. Batch Fetch Recommendations for all relevant zones
+            rec_map = {} # Key: "zone/name", Value: list of recs
+            rec_client = get_recommender_client()
+            
+            rec_tasks = [fetch_zone_recommendations(pid, z, rec_client, rec_map) for z in unique_zones]
+            await asyncio.gather(*rec_tasks)
+
+            # 3. Fetch Instance Technical Details
+            tasks = []
+            for inst in target_list:
+                z_short = inst.zone.split("/")[-1]
+                tasks.append(fetch_instances_details_excluding_rec(inst, pid, z_short))
+            
             results = await asyncio.gather(*tasks)
 
-            # 3. Process and Collect Data
+            # 4. Process and Collect Data
             processed_instances = []
             
             # Aggregates
@@ -394,20 +507,32 @@ async def get_instance_report(project_id: str = None, instance_name: str = "all"
 
             for i, inst in enumerate(target_list):
                 # Unpack details
-                (vcpu_str, ram_gb_str), (rec_text, savings), estimated_cost = results[i]
+                (vcpu_str, ram_gb_str), estimated_cost = results[i]
                 
+                # Match Recommendations
+                # We now use robust "zone/name" key
+                zone_short = inst.zone.split("/")[-1]
+                match_key = f"{zone_short}/{inst.name}"
+                
+                my_recs = rec_map.get(match_key, [])
+                
+                inst_rec_text = "None"
+                inst_savings = 0.0
+                
+                if my_recs:
+                    descriptions = [r["description"] for r in my_recs]
+                    inst_rec_text = " | ".join(descriptions)
+                    inst_savings = sum(r["savings"] for r in my_recs)
+
                 # Parse specific attributes
                 inst_cost = 0.0
-                inst_sav = 0.0
+                # inst_savings already float
                 inst_vcpu = 0
                 inst_ram = 0.0
                 
                 try: inst_cost = float(estimated_cost)
                 except: pass
                 
-                try: inst_sav = float(savings)
-                except: pass
-
                 try: inst_vcpu = int(vcpu_str)
                 except: pass
                 
@@ -416,7 +541,7 @@ async def get_instance_report(project_id: str = None, instance_name: str = "all"
                 
                 # Update Totals
                 total_cost += inst_cost
-                total_savings += inst_sav
+                total_savings += inst_savings
                 total_vcpu += inst_vcpu
                 total_ram += inst_ram
 
@@ -503,17 +628,17 @@ async def get_instance_report(project_id: str = None, instance_name: str = "all"
                     "int_ip": priv_ip,
                     "ext_ip": pub_ip,
                     "cost": inst_cost,
-                    "savings": inst_sav,
-                    "rec_text": rec_text
+                    "savings": inst_savings,
+                    "rec_text": inst_rec_text
                 })
 
-            # 4. Sort by Cost Descending
+            # 5. Sort by Cost Descending
             processed_instances.sort(key=lambda x: x["cost"], reverse=True)
 
-            # 5. Build Report
+            # 6. Build Report
             project_report = []
             
-            # Header (Small uniform headers)
+            # Header
             project_report.append(f"**📊 Project: `{pid}`**")
             if project_desc:
                 project_report.append(f"_{project_desc}_")
@@ -526,29 +651,33 @@ async def get_instance_report(project_id: str = None, instance_name: str = "all"
             project_report.append(f"• **Potential Savings:** `${total_savings:.2f}`")
             project_report.append("---")
 
-            # Cards - Uniform small font
-            # Enumeration start at 1
+            # Cards
             for idx, inst in enumerate(processed_instances, 1):
-                rec_icon = "⚠️" if inst["rec_text"] != "None" else "✅"
                 rec_str = ""
+                # Only show tip if distinct from None
                 if inst["rec_text"] != "None":
                      rec_str = f" | 💡 Tip: {inst['rec_text']}"
 
-                # Line 1: Enumeration + Name
+                # Line 1
                 line1 = f"**{idx}. 🖥️ `{inst['name']}`**"
                 
-                # Line 2: Status | Zone | Created
+                # Line 2
                 line2 = f"**Status:** {inst['status']} | **Zone:** {inst['zone']} | **Created:** {inst['created']}"
                 
-                # Line 3: Machine Type | vCPU | RAM | Total Disk Size
+                # Line 3
                 line3 = f"**Machine Type:** {inst['machine_type']} | **vCPU:** {inst['vcpu']} | **RAM:** {inst['ram']} GB | **Total Disk Size:** {inst['storage']}"
                 
-                # Line 4: OS | Int IP | Ext IP
+                # Line 4
                 ext_ip_display = inst['ext_ip'] if inst['ext_ip'] != "-" else "None"
                 line4 = f"**OS:** {inst['os']} | **Int IP:** {inst['int_ip']} | **Ext IP:** {ext_ip_display}"
                 
-                # Line 5: Cost | Savings
-                line5 = f"**💰 Cost:** ${inst['cost']:.2f}/mo | **💸 Savings:** ${inst['savings']:.2f}{rec_str}"
+                # Line 5
+                # Highlight savings if > 0
+                savings_display = f"${inst['savings']:.2f}"
+                if inst['savings'] > 0:
+                     savings_display = f"**${inst['savings']:.2f}**"
+                     
+                line5 = f"**💰 Cost:** ${inst['cost']:.2f}/mo | **💸 Savings:** {savings_display}{rec_str}"
 
                 project_report.append(f"{line1}\n{line2}\n{line3}\n{line4}\n{line5}")
                 project_report.append("---")
@@ -557,6 +686,7 @@ async def get_instance_report(project_id: str = None, instance_name: str = "all"
 
         except Exception as e:
             final_report.append(f"Error generating report for {pid}: {e}")
+            logger.error(f"Generate Report Error: {e}", exc_info=True)
 
     return "\n\n".join(final_report)
 

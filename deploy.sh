@@ -21,7 +21,9 @@ gcloud run deploy $BACKEND_SERVICE \
     --platform managed \
     --allow-unauthenticated \
     --set-env-vars GOOGLE_CLOUD_PROJECT=$PROJECT_ID,GOOGLE_CLOUD_LOCATION=$REGION,GOOGLE_GENAI_USE_VERTEXAI=true \
-    --service-account=mcp-manager@$PROJECT_ID.iam.gserviceaccount.com
+    --service-account=mcp-manager@$PROJECT_ID.iam.gserviceaccount.com \
+    --startup-probe initialDelaySeconds=5,periodSeconds=10,failureThreshold=30,httpGet.path=/health \
+    --liveness-probe initialDelaySeconds=5,periodSeconds=15,httpGet.path=/health
 
 # Get Backend URL
 BACKEND_URL=$(gcloud run services describe $BACKEND_SERVICE --region $REGION --format 'value(status.url)')

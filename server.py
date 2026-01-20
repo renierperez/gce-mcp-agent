@@ -14,6 +14,8 @@ from google.adk.runners import Runner
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
 from google.genai import types
 from agents import create_agent
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from google.api_core.exceptions import GoogleAPICallError, RetryError, ServiceUnavailable
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -32,8 +34,10 @@ app.add_middleware(
 )
 
 # Global State
+from fs_session import FirestoreSessionService
+# Global State
 agent = create_agent()
-session_service = InMemorySessionService()
+session_service = FirestoreSessionService()
 known_sessions = set()
 
 # Determine Firebase Project ID (use ENV or default to the one from Frontend config)
@@ -143,6 +147,52 @@ class ChatResponse(BaseModel):
     response: str
     session_id: str
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), retry=retry_if_exception_type((GoogleAPICallError, RetryError, ServiceUnavailable, IOError)))
+async def execute_agent_turn(runner, user_id, session_id, message_text):
+    full_response_text = []
+    async for event in runner.run_async(
+        user_id=user_id,
+        session_id=session_id,
+        new_message=types.Content(
+            role="user",
+            parts=[types.Part(text=message_text)]
+        )
+    ):
+        text_chunk = None
+        
+        # Check for function calls to avoid warnings/errors
+        has_func = False
+        if hasattr(event, 'parts'):
+            for p in event.parts:
+                if hasattr(p, 'function_call') and p.function_call:
+                    has_func = True
+        if hasattr(event, 'content') and hasattr(event.content, 'parts'):
+            for p in event.content.parts:
+                if hasattr(p, 'function_call') and p.function_call:
+                    has_func = True
+        
+        # If it's purely a function call event, we might skip text extraction or log it
+        if has_func and not (hasattr(event, 'text') and event.text):
+            continue
+
+        if hasattr(event, 'text') and event.text:
+            text_chunk = event.text
+        elif hasattr(event, 'part') and hasattr(event.part, 'text'):
+            text_chunk = event.part.text
+        elif hasattr(event, 'parts') and event.parts:
+            for p in event.parts:
+                if hasattr(p, 'text') and p.text:
+                    text_chunk = p.text # Concatenate if multiple?
+        elif hasattr(event, 'content') and event.content and hasattr(event.content, 'parts'):
+            for p in event.content.parts:
+                if hasattr(p, 'text') and p.text:
+                    text_chunk = p.text
+
+        if text_chunk:
+            full_response_text.append(text_chunk)
+            
+    return "".join(full_response_text)
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(req: ChatRequest, user: dict = Depends(verify_token)):
     session_id = req.session_id or str(uuid.uuid4())
@@ -174,57 +224,26 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(verify_token)):
         session_service=session_service
     )
 
-    full_response_text = []
-    
     try:
-        async for event in runner.run_async(
-            user_id=user_id,
-            session_id=session_id,
-            new_message=types.Content(
-                role="user",
-                parts=[types.Part(text=req.message)]
-            )
-        ):
-            # Extract text from various event types
-            text_chunk = None
-            
-            # Check for function calls to avoid warnings/errors
-            has_func = False
-            if hasattr(event, 'parts'):
-                for p in event.parts:
-                    if hasattr(p, 'function_call') and p.function_call:
-                        has_func = True
-            if hasattr(event, 'content') and hasattr(event.content, 'parts'):
-                 for p in event.content.parts:
-                    if hasattr(p, 'function_call') and p.function_call:
-                        has_func = True
-            
-            # If it's purely a function call event, we might skip text extraction or log it
-            if has_func and not (hasattr(event, 'text') and event.text):
-                continue
-
-            if hasattr(event, 'text') and event.text:
-                text_chunk = event.text
-            elif hasattr(event, 'part') and hasattr(event.part, 'text'):
-                text_chunk = event.part.text
-            elif hasattr(event, 'parts') and event.parts:
-                for p in event.parts:
-                    if hasattr(p, 'text') and p.text:
-                        text_chunk = p.text # Concatenate if multiple?
-            elif hasattr(event, 'content') and event.content and hasattr(event.content, 'parts'):
-                 for p in event.content.parts:
-                    if hasattr(p, 'text') and p.text:
-                         text_chunk = p.text
-
-            if text_chunk:
-                full_response_text.append(text_chunk)
+        final_response = await execute_agent_turn(runner, user_id, session_id, req.message)
+        return ChatResponse(response=final_response, session_id=session_id)
                 
     except Exception as e:
         logger.error(f"Error during agent execution: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-    final_response = "".join(full_response_text)
-    return ChatResponse(response=final_response, session_id=session_id)
+@app.get("/health")
+async def health_check():
+    """Readiness probe."""
+    try:
+        # Simple check: can we get the firestore client?
+        # We won't do a heavy query to save costs/latency on frequent checks,
+        # but ensuring the client initializes is good.
+        firestore.client() 
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        raise HTTPException(status_code=503, detail="Service not ready")
 
 @app.on_event("startup")
 async def startup_event():

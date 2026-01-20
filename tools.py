@@ -11,6 +11,8 @@ from google.cloud import recommender_v1
 from google.cloud import billing_v1
 from google.api_core.client_options import ClientOptions
 from typing import List, Optional
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from google.api_core.exceptions import GoogleAPICallError, RetryError
 
 # Configuration
 ZONE = "us-central1-a"
@@ -96,6 +98,7 @@ async def list_managed_projects():
     except Exception as e:
         return f"Error listing projects: {e}"
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), retry=retry_if_exception_type((GoogleAPICallError, RetryError, IOError)))
 async def list_instances(project_id: str = None):
     """
     Lists all GCE instances across ALL zones in the project.
@@ -160,6 +163,7 @@ async def find_instance_zone(project_id: str, instance_name: str) -> Optional[st
         logger.error(f"Error finding zone for {instance_name}: {e}")
     return None
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), retry=retry_if_exception_type((GoogleAPICallError, RetryError, IOError)))
 async def start_instance(instance_name: str, project_id: str = None, zone: str = None):
     """Starts a specific GCE instance. Auto-detects zone if not provided."""
     if instance_name == "all":
@@ -191,6 +195,7 @@ async def start_instance(instance_name: str, project_id: str = None, zone: str =
         logger.error(f"Error starting instance {instance_name}: {e}")
         return f"Error starting instance '{instance_name}': {e}"
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), retry=retry_if_exception_type((GoogleAPICallError, RetryError, IOError)))
 async def stop_instance(instance_name: str, project_id: str = None, zone: str = None):
     """Stops a specific GCE instance. Auto-detects zone if not provided."""
     if instance_name == "all":
@@ -350,6 +355,7 @@ async def estimate_monthly_cost(instance, project_id, zone):
 # Pre-compile regex for performance
 RESOURCE_PATTERN = re.compile(r"zones/([^/]+)/instances/([^/]+)")
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), retry=retry_if_exception_type((GoogleAPICallError, RetryError, IOError)))
 async def fetch_zone_recommendations(project_id, zone, client, rec_map):
     """Fetches recommendations for a specific zone and populates rec_map."""
     recommenders = [

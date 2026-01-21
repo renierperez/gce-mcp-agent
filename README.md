@@ -8,10 +8,12 @@ A secure, **Multi-Agent System** for managing Google Compute Engine infrastructu
 ## 🚀 Key Features
 
 - **Natural Language DevOps**: "Start the development instance", "List all running servers", "Why is my bill so high?".
+- **Multi-Project Management**: Seamlessly manage instances across multiple Google Cloud projects.
+- **FinOps & Cost Intelligence**: Real-time "True Cost" calculation (including attached disks) and Savings recommendations.
+- **Detailed SKU Audits**: Deep dive into billing SKUs with Uptime tracking and hardware specifications.
 - **Secure Public Access**: Accessible from anywhere (no VPN required) via **Zero Trust** security.
 - **Dynamic Access Control**: Manage authorized users in real-time via **Firestore** (no redeployment needed).
 - **Modern UI**: Responsive Flutter Web application with Markdown support for rich reports.
-- **Cost Aware**: Analyzes machine types and provider specs (powered by Gemini).
 
 ## 🏗️ Architecture
 

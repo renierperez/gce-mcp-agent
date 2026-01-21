@@ -8,3 +8,6 @@ google-cloud-compute
 google-cloud-recommender
 google-cloud-billing
 tenacity
+google-cloud-bigquery
+pandas
+db-dtypes

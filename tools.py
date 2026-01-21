@@ -228,13 +228,25 @@ async def stop_instance(instance_name: str, project_id: str = None, zone: str = 
 def get_machine_type_details_sync(machine_type_url, zone, project_id):
     short_type = machine_type_url.split("/")[-1]
     
-    # Check for custom type First
+    # 1. Check for custom type
     import re
     match = re.search(r".*-custom-(\d+)-(\d+)", short_type)
     if match:
         vcpu = match.group(1)
         memory_mb = int(match.group(2))
         return vcpu, f"{memory_mb / 1024:.1f}"
+
+    # 2. Heuristic for Standard/HighMem/HighCpu types (e.g. n2-standard-4, e2-highcpu-32)
+    # Pattern: [family]-[class]-[vcpus]
+    match_std = re.search(r".*-[a-z]+-(\d+)$", short_type)
+    if match_std:
+        vcpu = match_std.group(1)
+        # Memory is harder to guess without API, but vCPU is enough for uptime.
+        # We can return "?" for memory if we don't know it, or try to guess.
+        # For valid uptime, we just need vCPU.
+        # Let's try to fetch via API for memory, but use Heuristic vCPU as fallback or primary?
+        # If API fails, we want at least vCPU to work.
+        pass
 
     try:
         client = compute_v1.MachineTypesClient()
@@ -245,7 +257,16 @@ def get_machine_type_details_sync(machine_type_url, zone, project_id):
         )
         mt = client.get(request=request)
         return str(mt.guest_cpus), f"{mt.memory_mb / 1024:.1f}"
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Error fetching machine type {short_type}: {e}")
+        # 3. Fallback Heuristic if API failed
+        if match_std:
+             return match_std.group(1), "?"
+        
+        # 4. Fallback for shared core
+        if short_type in ["e2-medium", "e2-small", "e2-micro"]: return "2", "?"
+        if short_type in ["f1-micro", "g1-small"]: return "1", "?"
+        
         return "?", "?"
 
 async def get_instance_recommendations(project, zone, instance_name):
@@ -419,11 +440,20 @@ async def fetch_zone_recommendations(project_id, zone, client, rec_map):
         except Exception as e:
             logger.warning(f"Failed to list recommendations for {zone}/{rec_id}: {e}")
 
+from billing import BillingService
+
+# ... (global)
+_billing_service = None
+def get_billing_service():
+    global _billing_service
+    if not _billing_service:
+        _billing_service = BillingService()
+    return _billing_service
+
 async def get_instance_report(project_id: str = None, instance_name: str = "all"):
     """
     Generates a detailed Markdown Table report for GCE instances.
-    Includes cost estimation and sizing recommendations.
-    Uses generic batching for recommendations to be efficient and accurate.
+    Includes True Cost (BigQuery) and sizing recommendations.
     """
     managed_projects = []
     if project_id == "all":
@@ -439,17 +469,27 @@ async def get_instance_report(project_id: str = None, instance_name: str = "all"
     
     # Semaphore for instance details
     sem = asyncio.Semaphore(10)
+    billing_svc = get_billing_service()
 
     async def fetch_instances_details_excluding_rec(inst, pid, zone_short):
         mt_url = inst.machine_type
         short_mt = mt_url.split("/")[-1]
         
         async with sem:
-             # Just fetch machine type detailssync and estimate cost
-             # Recommender is handled separately now
+             # Extract extra resources (Disks)
+             extra_resources = []
+             if inst.disks:
+                 for d in inst.disks:
+                     if d.source:
+                         disk_name = d.source.split("/")[-1]
+                         if disk_name != inst.name:
+                             extra_resources.append(disk_name)
+
+             # Fetch Machine Type, Estimate Cost, AND True Cost
              return await asyncio.gather(
                  asyncio.to_thread(get_machine_type_details_sync, short_mt, zone_short, pid),
-                 estimate_monthly_cost(inst, pid, zone_short)
+                 estimate_monthly_cost(inst, pid, zone_short),
+                 billing_svc.get_instance_cost(pid, inst.name, extra_resource_names=extra_resources)
              )
 
     for pid in managed_projects:
@@ -480,21 +520,19 @@ async def get_instance_report(project_id: str = None, instance_name: str = "all"
             # 1. Fetch Project Description
             project_desc = ""
             try:
-                # Assuming 'db' is available globally
                 doc = _get_firestore_client().collection("managed_projects").document(pid).get()
                 if doc.exists:
                      project_desc = doc.to_dict().get("description", "")
             except Exception:
                 pass 
 
-            # 2. Batch Fetch Recommendations for all relevant zones
-            rec_map = {} # Key: "zone/name", Value: list of recs
+            # 2. Batch Fetch Recommendations
+            rec_map = {} 
             rec_client = get_recommender_client()
-            
             rec_tasks = [fetch_zone_recommendations(pid, z, rec_client, rec_map) for z in unique_zones]
             await asyncio.gather(*rec_tasks)
 
-            # 3. Fetch Instance Technical Details
+            # 3. Fetch Instance Details (Tech + Billing)
             tasks = []
             for inst in target_list:
                 z_short = inst.zone.split("/")[-1]
@@ -505,54 +543,56 @@ async def get_instance_report(project_id: str = None, instance_name: str = "all"
             # 4. Process and Collect Data
             processed_instances = []
             
-            # Aggregates
-            total_cost = 0.0
+            total_estimated_cost = 0.0
+            total_true_cost = 0.0
             total_savings = 0.0
             total_vcpu = 0
             total_ram = 0.0
             project_total_disk_gb = 0
 
             for i, inst in enumerate(target_list):
-                # Unpack details
-                (vcpu_str, ram_gb_str), estimated_cost = results[i]
+                (vcpu_str, ram_gb_str), estimated_cost, true_cost_data = results[i]
                 
-                # Match Recommendations
-                # We now use robust "zone/name" key
+                # Recommendations
                 zone_short = inst.zone.split("/")[-1]
                 match_key = f"{zone_short}/{inst.name}"
-                
                 my_recs = rec_map.get(match_key, [])
                 
                 inst_rec_text = "None"
                 inst_savings = 0.0
-                
                 if my_recs:
                     descriptions = [r["description"] for r in my_recs]
                     inst_rec_text = " | ".join(descriptions)
                     inst_savings = sum(r["savings"] for r in my_recs)
 
-                # Parse specific attributes
-                inst_cost = 0.0
-                # inst_savings already float
-                inst_vcpu = 0
-                inst_ram = 0.0
-                
-                try: inst_cost = float(estimated_cost)
+                # Costs
+                inst_est_cost = 0.0
+                try: inst_est_cost = float(estimated_cost)
                 except: pass
                 
+                inst_true_cost = 0.0
+                has_true_cost = False
+                if true_cost_data:
+                    inst_true_cost = true_cost_data.get("total_net_cost", 0.0)
+                    has_true_cost = True
+
+                # Hardware
+                inst_vcpu = 0
                 try: inst_vcpu = int(vcpu_str)
                 except: pass
                 
+                inst_ram = 0.0
                 try: inst_ram = float(ram_gb_str)
                 except: pass
                 
                 # Update Totals
-                total_cost += inst_cost
+                total_estimated_cost += inst_est_cost
+                total_true_cost += inst_true_cost
                 total_savings += inst_savings
                 total_vcpu += inst_vcpu
                 total_ram += inst_ram
 
-                # Parse other fields
+                # Metadata
                 name = inst.name
                 status = "🟢 RUNNING" if inst.status == "RUNNING" else "🔴 TERMINATED" if inst.status == "TERMINATED" else inst.status
                 
@@ -562,9 +602,8 @@ async def get_instance_report(project_id: str = None, instance_name: str = "all"
                     except: created_str = inst.creation_timestamp[:10]
 
                 mt_short = inst.machine_type.split("/")[-1]
-                zone_short = inst.zone.split("/")[-1]
                 
-                # IPs
+                # Network
                 priv_ip = "-"
                 pub_ip = "-"
                 if inst.network_interfaces:
@@ -573,21 +612,18 @@ async def get_instance_report(project_id: str = None, instance_name: str = "all"
                     if nic0.access_configs:
                         pub_ip = nic0.access_configs[0].nat_i_p
                 
-                # Disk & OS
+                # Disks
                 total_disk_gb = 0
                 disk_details = []
                 os_name = "?"
-                
-                disks = inst.disks
-                for d in disks:
+                for d in inst.disks:
                     sz = d.disk_size_gb
                     total_disk_gb += sz
                     dtype = "Std"
                     if "pd-ssd" in d.type: dtype = "SSD"
                     elif "pd-balanced" in d.type: dtype = "Bal"
-                    
                     disk_details.append(f"{sz}G {dtype}")
-
+                    
                     if d.boot and d.licenses:
                         for lic in d.licenses:
                             lower_lic = lic.lower()
@@ -617,13 +653,13 @@ async def get_instance_report(project_id: str = None, instance_name: str = "all"
                                 ver = next((p for p in parts if p.isdigit()), "")
                                 os_name = f"CentOS {ver}"
                                 break
-                
+
                 storage_str = f"{total_disk_gb}G"
                 if disk_details:
                     storage_str += f" ({', '.join(disk_details)})"
                 
                 project_total_disk_gb += total_disk_gb
-                
+
                 processed_instances.append({
                     "name": name,
                     "status": status,
@@ -636,13 +672,15 @@ async def get_instance_report(project_id: str = None, instance_name: str = "all"
                     "os": os_name,
                     "int_ip": priv_ip,
                     "ext_ip": pub_ip,
-                    "cost": inst_cost,
+                    "est_cost": inst_est_cost,
+                    "true_cost": inst_true_cost,
+                    "has_true_cost": has_true_cost,
                     "savings": inst_savings,
                     "rec_text": inst_rec_text
                 })
 
-            # 5. Sort by Cost Descending
-            processed_instances.sort(key=lambda x: x["cost"], reverse=True)
+            # 5. Sort by True Cost (if avail) else Est Cost
+            processed_instances.sort(key=lambda x: x["true_cost"] if x["has_true_cost"] else x["est_cost"], reverse=True)
 
             # 6. Build Report
             project_report = []
@@ -654,40 +692,45 @@ async def get_instance_report(project_id: str = None, instance_name: str = "all"
             
             project_report.append("**📈 Project Summary**")
             project_report.append(f"• **Instances:** {len(target_list)}")
-            project_report.append(f"• **Total vCPU:** {total_vcpu}")
+            project_report.append(f"• **Available vCPU:** {total_vcpu}")
             project_report.append(f"• **Total RAM:** {total_ram:.1f} GB")
-            project_report.append(f"• **Total Disk Size:** {project_total_disk_gb} GB")
-            project_report.append(f"• **Monthly Cost:** `${total_cost:.2f}`")
-            project_report.append(f"• **Potential Savings:** `${total_savings:.2f}`")
+            project_report.append(f"• **Total Disk:** {project_total_disk_gb} GB")
+            
+            # Show both estimated and true cost in summary
+            # 'Monthly Cost' usually implies run rate. 'True Cost (30d)' is historical.
+            # We'll show True Cost as primary if non-zero.
+            if total_true_cost > 0:
+                project_report.append(f"• **True Cost (30d):** `${total_true_cost:.2f}`")
+            else:
+                 project_report.append(f"• **Est. Monthly Cost:** `${total_estimated_cost:.2f}`")
+            
+            if total_savings > 0:
+                project_report.append(f"• **Potential Savings:** `${total_savings:.2f}`")
             project_report.append("---")
 
             # Cards
             for idx, inst in enumerate(processed_instances, 1):
                 rec_str = ""
-                # Only show tip if distinct from None
                 if inst["rec_text"] != "None":
                      rec_str = f" | 💡 Tip: {inst['rec_text']}"
 
-                # Line 1
                 line1 = f"**{idx}. 🖥️ `{inst['name']}`**"
-                
-                # Line 2
                 line2 = f"**Status:** {inst['status']} | **Zone:** {inst['zone']} | **Created:** {inst['created']}"
+                line3 = f"**Type:** {inst['machine_type']} | **vCPU:** {inst['vcpu']} | **RAM:** {inst['ram']} GB | **Disk:** {inst['storage']}"
                 
-                # Line 3
-                line3 = f"**Machine Type:** {inst['machine_type']} | **vCPU:** {inst['vcpu']} | **RAM:** {inst['ram']} GB | **Total Disk Size:** {inst['storage']}"
-                
-                # Line 4
                 ext_ip_display = inst['ext_ip'] if inst['ext_ip'] != "-" else "None"
                 line4 = f"**OS:** {inst['os']} | **Int IP:** {inst['int_ip']} | **Ext IP:** {ext_ip_display}"
                 
-                # Line 5
-                # Highlight savings if > 0
                 savings_display = f"${inst['savings']:.2f}"
                 if inst['savings'] > 0:
                      savings_display = f"**${inst['savings']:.2f}**"
-                     
-                line5 = f"**💰 Cost:** ${inst['cost']:.2f}/mo | **💸 Savings:** {savings_display}{rec_str}"
+                
+                # Cost Line: Prioritize True Cost
+                cost_str = f"${inst['est_cost']:.2f}/mo (Est)"
+                if inst['has_true_cost']:
+                     cost_str = f"**${inst['true_cost']:.2f}** (30d)"
+                
+                line5 = f"**💰 Cost:** {cost_str} | **💸 Savings:** {savings_display}{rec_str}"
 
                 project_report.append(f"{line1}\n{line2}\n{line3}\n{line4}\n{line5}")
                 project_report.append("---")
@@ -699,6 +742,285 @@ async def get_instance_report(project_id: str = None, instance_name: str = "all"
             logger.error(f"Generate Report Error: {e}", exc_info=True)
 
     return "\n\n".join(final_report)
+
+async def get_instance_sku_report(project_id: str = None, instance_name: str = None):
+    """
+    Generates a detailed detailed SKU breakdown report for a specific instance.
+    Includes Net Cost, Gross Cost, and Usage details from Billing.
+    If project_id is not specified, searches across all managed projects.
+    """
+    if not instance_name:
+        return "⚠️ Error: Please specify an instance name for the detailed SKU report."
+
+    # Determine which projects to search
+    target_projects = []
+    if project_id:
+        try:
+            resolved = await asyncio.to_thread(resolve_project_id, project_id)
+            target_projects.append(resolved)
+        except ValueError as e:
+            return str(e)
+    else:
+        # Search all managed projects
+        target_projects = await asyncio.to_thread(get_managed_projects)
+
+    billing_svc = get_billing_service()
+    
+    sku_details = None
+    found_project = None
+
+    # Iterate/Search for Instance First using API to get attached SKUs (Disks)
+    # We prioritize API finding to capture dynamic resource names like external disks
+    instance_obj = None
+    found_zone = None
+    extra_resources = []
+    
+    # Try api find first
+    for pid in target_projects:
+        try:
+            zone = await find_instance_zone(pid, instance_name)
+            if zone:
+                found_project = pid
+                found_zone = zone
+                # Fetch full instance object
+                client = get_instances_client()
+                instance_obj = await asyncio.to_thread(client.get, project=pid, zone=zone, instance=instance_name)
+                
+                # Extract extra resources (Disks)
+                if instance_obj and instance_obj.disks:
+                    for d in instance_obj.disks:
+                        # d.source is like projects/{proj}/zones/{zone}/disks/{disk_name}
+                        if d.source:
+                             disk_name = d.source.split("/")[-1]
+                             # Only add if it's NOT the instance name (which is already covered)
+                             if disk_name != instance_name:
+                                 extra_resources.append(disk_name)
+                break
+        except Exception as e:
+            # Not found in this project or other error
+            continue
+
+    # Query Billing
+    # If we found it via API, use that project. If not, fallback to loop search in billing.
+    if found_project:
+        # Single targeted query
+        try:
+            sku_details = await billing_svc.get_instance_sku_details(found_project, instance_name, extra_resource_names=extra_resources)
+        except Exception as e:
+            logger.error(f"Billing query failed for {instance_name} in {found_project}: {e}")
+    else:
+        # Fallback: We didn't find it in API (maybe deleted?), so we blindly search billing
+        # Note: We won't have extra_resources here since we couldn't read the instance config
+        for pid in target_projects:
+            try:
+                details = await billing_svc.get_instance_sku_details(pid, instance_name)
+                if details:
+                    sku_details = details
+                    found_project = pid
+                    break
+            except Exception as e:
+                pass
+    
+    if not sku_details:
+        projects_checked = ", ".join(target_projects)
+        return f"### 📊 Instance SKU Report: `{instance_name}`\nNo billing data found for the last 30 days in projects: `{projects_checked}`.\nVerify the instance name is correct (CASE SENSITIVE for database, though we use LIKE)."
+    
+    # Calculate Totals First
+    total_net = sum(row.get("net_cost", 0.0) for row in sku_details)
+    total_gross = sum(row.get("gross_cost", 0.0) for row in sku_details)
+
+    # 1. Fetch Rich Instance Details (Status, Hardware, etc.)
+    header_details = ""
+    try:
+        # If we already have the object, use it
+        if instance_obj and found_zone and found_project:
+             header_details = await _get_instance_details_string(found_project, found_zone, instance_obj, total_net, sku_details)
+        # If we found it via billing (fallback) but not API, we might try to find it now?
+        # But if we failed before, we likely fail again.
+    except Exception as e:
+        logger.warning(f"Failed to fetch detailed instance info for header: {e}")
+
+    # Format as Markdown Table
+    lines = []
+    
+    # Use rich header if available, else fallback
+    if header_details:
+        lines.append(header_details)
+    else:
+        lines.append(f"### 📊 Instance SKU Report: `{instance_name}`")
+        lines.append(f"**Project:** `{found_project}` | **Period:** Last 30 Days")
+        lines.append(f"**💰 Total Net Cost:** `${total_net:,.2f}` (Gross: ${total_gross:,.2f})")
+    
+    lines.append("")
+    lines.append("| # | SKU ID | SKU Description | Usage | Gross Cost | Net Cost |")
+    lines.append("| :--- | :--- | :--- | :--- | :---: | :---: |")
+    
+    for idx, row in enumerate(sku_details, 1):
+        sku_id = row.get("sku_id", "N/A")
+        desc = row.get("sku_description", "Unknown SKU")
+        unit = row.get("usage_unit", "")
+        amount = row.get("total_usage_amount", 0.0)
+        gross = row.get("gross_cost", 0.0)
+        net = row.get("net_cost", 0.0)
+        
+        # Filter handled by SQL HAVING clause now.
+        
+        # Format usage
+        usage_str = f"{amount:,.2f} {unit}"
+        
+        lines.append(f"| {idx} | {sku_id} | {desc} | {usage_str} | ${gross:,.2f} | **${net:,.2f}** |")
+        
+    lines.append("")
+    
+    return "\n".join(lines)
+
+async def _get_instance_details_string(project_id, zone, instance_obj, true_cost=0.0, sku_details=None):
+    """
+    Helper to fetch and format instance details for the SKU report header.
+    Accepts an existing instance_obj to avoid re-fetching.
+    """
+    try:
+        inst = instance_obj
+        
+        # Machine Type
+        mt_short = inst.machine_type.split("/")[-1]
+        vcpu, ram = get_machine_type_details_sync(mt_short, zone, project_id)
+        
+        # Status
+        status_icon = "🟢" if inst.status == "RUNNING" else "🔴" if inst.status == "TERMINATED" else "❓"
+        status_str = f"{status_icon} {inst.status}"
+        
+        # Creation
+        created = "?"
+        if inst.creation_timestamp:
+            created = inst.creation_timestamp.split("T")[0]
+            
+        # Uptime Calculation (if SKU details provided)
+        uptime_str = ""
+        # Convert vcpu to simple number
+        try:
+            vcpu_num = int(float(vcpu))
+        except:
+            vcpu_num = 0
+            
+        if sku_details and vcpu_num > 0:
+            total_usage_seconds = 0.0
+            for row in sku_details:
+                # Look for "Instance Core" usage
+                desc = row.get("sku_description", "").lower()
+                usage_unit = row.get("usage_unit", "").lower()
+                
+                # "instance core" usually covers the vCPU usage
+                # We need to ensure we are summing seconds.
+                if "instance core" in desc and "second" in usage_unit:
+                    try:
+                        # Fixed key: total_usage_amount (was usage)
+                        usage_val = float(row.get("total_usage_amount", 0))
+                        total_usage_seconds += usage_val
+                    except: pass
+            
+            if total_usage_seconds > 0:
+                # Formula: Usage (seconds) / (vCPU * 3600)
+                uptime_hours = total_usage_seconds / (vcpu_num * 3600)
+                uptime_str = f" | ⏰ **Uptime**: {uptime_hours:.2f}h"
+
+        # OS & Disk
+        total_disk_gb = 0
+        disk_details = []
+        os_name = "?"
+        
+        # Initialize Disks Client
+        disks_client = get_disks_client()
+
+        for d in inst.disks:
+            sz = d.disk_size_gb
+            total_disk_gb += sz
+            
+            # Fetch Disk Resource to get accurate type (Std/SSD/Bal)
+            dtype = "Std" # Default
+            try:
+                if d.source:
+                    # d.source format: projects/{project}/zones/{zone}/disks/{disk_name}
+                    disk_name = d.source.split("/")[-1]
+                    # We can use the sync client here as it's inside an async function loop but it might block slightly
+                    # For a few disks it's negligible.
+                    disk_obj = disks_client.get(project=project_id, zone=zone, disk=disk_name)
+                    
+                    if "pd-ssd" in disk_obj.type: dtype = "SSD"
+                    elif "pd-balanced" in disk_obj.type: dtype = "Bal"
+                    elif "pd-standard" in disk_obj.type: dtype = "Std"
+                    else: dtype = " Unk" 
+            except Exception as e:
+                logger.warning(f"Failed to fetch disk details for {d.source}: {e}")
+                
+            disk_details.append(f"{sz}G {dtype}")
+
+            # OS Detection from Boot Disk
+            if d.boot and d.licenses:
+                for lic in d.licenses:
+                    lower_lic = lic.lower()
+                    if "windows" in lower_lic:
+                        parts = lic.split("/")[-1].split("-")
+                        ver = next((p for p in parts if p.isdigit() and len(p)==4), "Server")
+                        os_name = f"Windows {ver}"
+                    elif "debian" in lower_lic: os_name = "Debian"
+                    elif "ubuntu" in lower_lic: os_name = "Ubuntu"
+                    elif "rhel" in lower_lic: os_name = "RHEL"
+                    elif "centos" in lower_lic: os_name = "CentOS"
+                    elif "sles" in lower_lic: os_name = "SLES"
+                    elif "rocky" in lower_lic: os_name = "Rocky"
+
+        storage_str = f"{total_disk_gb}G"
+        if disk_details:
+             storage_str += f" ({', '.join(disk_details)})"
+
+        # IPs
+        int_ip = inst.network_interfaces[0].network_i_p if inst.network_interfaces else "?"
+        ext_ip = "None"
+        if inst.network_interfaces and inst.network_interfaces[0].access_configs:
+            ext_ip = inst.network_interfaces[0].access_configs[0].nat_i_p
+
+        # Cost & Savings
+        cost_str = f"💰 Cost: ${true_cost:,.2f} (30d)"
+        
+        # Calculate Savings
+        savings = 0.0
+        try:
+            # 1. Initialize Recommender Client
+            rec_client = get_recommender_client()
+            
+            # 2. Fetch recommendations for this zone (reuse existing helper)
+            rec_map = {}
+            # We await the helper which populates rec_map by reference
+            await fetch_zone_recommendations(project_id, zone, rec_client, rec_map)
+            
+            # 3. Lookup this instance in the map
+            # Key format used in helper: "zone_short/instance_name"
+            # We need to construct the key carefully
+            zone_short = zone.split("/")[-1]
+            match_key = f"{zone_short}/{inst.name}"
+            
+            my_recs = rec_map.get(match_key, [])
+            if my_recs:
+                savings = sum(r["savings"] for r in my_recs)
+                logger.info(f"Adding savings for {inst.name}: ${savings}")
+                
+        except Exception as e:
+            logger.warning(f"Failed to fetch savings for {inst.name}: {e}")
+
+        savings_str = f"💸 Savings: ${savings:,.2f}"
+
+        # Format Lines
+        line1 = f"### 📊 Instance SKU Report: `{inst.name}`"
+        line2 = f"**Project**: {project_id} **Status**: {status_str} | **Zone**: {zone} | **Created**: {created}{uptime_str}"
+        line3 = f"**Type**: {mt_short} | **vCPU**: {vcpu} | **RAM**: {ram} | **Disk**: {storage_str}"
+        line4 = f"**OS**: {os_name} | **Int IP**: {int_ip} | **Ext IP**: {ext_ip} | {cost_str} | {savings_str}"
+
+        return f"{line1}\n{line2}\n{line3}\n{line4}\n"
+
+    except Exception as e:
+        logger.error(f"Error formatting instance details: {e}")
+        return f"### Instance SKU Report: {instance_obj.name} (Error fetching details)"
 
 async def create_custom_instance(name, project_id=None, machine_type="n2-custom-2-4096", image_family="rhel-9", boot_disk_size="10", extra_disk_size="0"):
     """Creates a new custom instance."""

@@ -33,7 +33,8 @@ def create_agent():
             tools.start_instance,
             tools.stop_instance,
             tools.list_managed_projects,
-            tools.create_custom_instance
+            tools.create_custom_instance,
+            tools.get_instance_sku_report
         ],
         instruction=combined_instructions
     )

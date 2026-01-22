@@ -35,10 +35,36 @@ graph LR
 
 ## 🛠️ Setup & Deployment
 
-### Prerequisites
-1.  **Google Cloud Project** with Billing enabled.
-2.  **Firebase Project** linked to the GCP Project.
-3.  **GCloud CLI** installed and authenticated.
+### Prerequisites (GCP Architect Guide)
+
+#### 1. APIs to Enable
+Ensure the following APIs are enabled in your project:
+- **Compute Engine API** (`compute.googleapis.com`)
+- **Cloud Run API** (`run.googleapis.com`)
+- **Vertex AI API** (`aiplatform.googleapis.com`)
+- **Cloud Build API** (`cloudbuild.googleapis.com`)
+- **Firestore API** (`firestore.googleapis.com`)
+- **BigQuery API** (`bigquery.googleapis.com`)
+- **Recommender API** (`recommender.googleapis.com`)
+
+#### 2. Service Account & IAM
+Create a service account (default expected: `mcp-manager@YOUR_PROJECT.iam.gserviceaccount.com`) and grant:
+- `roles/compute.admin`: Manage instances (Start/Stop/Create).
+- `roles/aiplatform.user`: Access Gemini 2.5 Pro.
+- `roles/datastore.user`: Application DB access (Firestore).
+- `roles/bigquery.jobUser`: Execute cost analysis queries.
+- `roles/recommender.viewer`: Fetch savings recommendations.
+
+> **Note**: For FinOps features, grant `roles/bigquery.dataViewer` on the *Billing Data Dataset* specifically.
+
+#### 3. FinOps Configuration
+To enable **True Cost** and **Savings** reports:
+1.  **Billing Export**: Enable "Detailed usage cost export" to BigQuery in the Billing Console.
+2.  **Configuration**: Update `BILLING_TABLE_ID` in `billing.py` with your export table name.
+
+#### 4. Critical Dependencies
+- **GCloud CLI**: Installed and authenticated.
+- **Firebase Project**: Linked for Authentication.
 
 ### 1. Configuration
 This repository uses a **secure configuration pattern**. The Firebase config is **not** committed to the repo.

@@ -165,7 +165,17 @@ async def find_instance_zone(project_id: str, instance_name: str) -> Optional[st
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), retry=retry_if_exception_type((GoogleAPICallError, RetryError, IOError)))
 async def start_instance(instance_name: str, project_id: str = None, zone: str = None):
-    """Starts a specific GCE instance. Auto-detects zone if not provided."""
+    """
+    Starts a specific GCE instance. Auto-detects zone if not provided.
+    REQUIRES 'admin' ROLE.
+    """
+    # RBAC Guard
+    try:
+        import user_context
+        user_context.require_admin()
+    except PermissionError as e:
+        return f"⛔ {e}"
+
     if instance_name == "all":
         return "Please specify an instance name. Bulk actions are restricted for safety."
 
@@ -197,7 +207,17 @@ async def start_instance(instance_name: str, project_id: str = None, zone: str =
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), retry=retry_if_exception_type((GoogleAPICallError, RetryError, IOError)))
 async def stop_instance(instance_name: str, project_id: str = None, zone: str = None):
-    """Stops a specific GCE instance. Auto-detects zone if not provided."""
+    """
+    Stops a specific GCE instance. Auto-detects zone if not provided.
+    REQUIRES 'admin' ROLE.
+    """
+    # RBAC Guard
+    try:
+        import user_context
+        user_context.require_admin()
+    except PermissionError as e:
+        return f"⛔ {e}"
+
     if instance_name == "all":
          return "Please specify an instance name. Bulk actions are restricted for safety."
 
@@ -1023,7 +1043,17 @@ async def _get_instance_details_string(project_id, zone, instance_obj, true_cost
         return f"### Instance SKU Report: {instance_obj.name} (Error fetching details)"
 
 async def create_custom_instance(name, project_id=None, machine_type="n2-custom-2-4096", image_family="rhel-9", boot_disk_size="10", extra_disk_size="0"):
-    """Creates a new custom instance."""
+    """
+    Creates a new custom instance.
+    REQUIRES 'admin' ROLE.
+    """
+    # RBAC Guard
+    try:
+        import user_context
+        user_context.require_admin()
+    except PermissionError as e:
+        return f"⛔ {e}"
+
     final_name = name.lower().replace("_", "-")
     
     try:

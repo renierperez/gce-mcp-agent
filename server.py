@@ -59,7 +59,7 @@ from firebase_admin import auth, credentials, firestore
 # ... (Previous code)
 
 
-# Auth Cache: {email: (timestamp, is_allowed)}
+# Auth Cache: {email: (timestamp, is_allowed, role)}
 _auth_cache = {}
 AUTH_CACHE_TTL = 300  # 5 minutes
 
@@ -73,7 +73,7 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Security(security))
         # Check Cache
         now = time.time()
         if email in _auth_cache:
-            ts, is_allowed = _auth_cache[email]
+            ts, is_allowed, role = _auth_cache[email]
             if now - ts < AUTH_CACHE_TTL:
                 if not is_allowed:
                      logger.warning(f"Unauthorized access attempt by {email} (Cached Deny)")
@@ -81,45 +81,44 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Security(security))
                          status_code=403, 
                          detail="Access Denied: You do not have permission to access the GCE Manager Agent."
                      )
+                # Inject role into token dict for downstream use
+                decoded_token["role"] = role
                 return decoded_token
 
         # Access Control (Firestore)
-        # We check if a document exists with the user's email or if the email is in a trusted list
         try:
             db = firestore.client()
-            # Check for document in 'allowed_users' collection with ID = email
-            # Structure: Collection 'allowed_users' -> Document 'email@example.com'
             user_ref = db.collection('allowed_users').document(email)
             doc = user_ref.get()
             
             if not doc.exists:
-                 # Cache the failure
-                 _auth_cache[email] = (now, False)
-                 
+                 _auth_cache[email] = (now, False, "viewer")
                  logger.warning(f"Unauthorized access attempt by {email} (Not found in Firestore)")
                  raise HTTPException(
                      status_code=403, 
-                     detail="Access Denied: You do not have permission to access the GCE Manager Agent. Please contact the administrator to request access. Once authorized, you will be able to manage GCE instances, estimate monthly costs, and monitor infrastructure directly from this interface."
+                     detail="Access Denied: You do not have permission to access the GCE Manager Agent. Please contact the administrator."
                  )
                  
-            # Optional: Check for an 'active' field if you want to soft-disable
-            # For simplicity, we assume existence = access for now, or check 'active'
             user_data = doc.to_dict()
             if not user_data.get('active', True):
-                 _auth_cache[email] = (now, False)
+                 _auth_cache[email] = (now, False, "viewer")
                  logger.warning(f"Unauthorized access attempt by {email} (User disabled)")
                  raise HTTPException(
                      status_code=403, 
-                     detail="Access Denied: Your account has been temporarily disabled. Please contact the administrator."
+                     detail="Access Denied: Your account has been temporarily disabled."
                  )
             
+            # Extract Role (default to viewer)
+            role = user_data.get('role', 'viewer')
+            
             # Cache the success
-            _auth_cache[email] = (now, True)
+            _auth_cache[email] = (now, True, role)
+            
+            decoded_token["role"] = role
 
         except HTTPException as he:
             raise he
         except Exception as e:
-            # Fallback for connectivity issues or initial setup (allow if Firestore fails? No, fail secure)
             logger.error(f"Firestore Authorization Error: {e}")
             raise HTTPException(status_code=403, detail="Authorization service unavailable. Please try again later.")
              
@@ -182,7 +181,7 @@ async def execute_agent_turn(runner, user_id, session_id, message_text):
         elif hasattr(event, 'parts') and event.parts:
             for p in event.parts:
                 if hasattr(p, 'text') and p.text:
-                    text_chunk = p.text # Concatenate if multiple?
+                    text_chunk = p.text 
         elif hasattr(event, 'content') and event.content and hasattr(event.content, 'parts'):
             for p in event.content.parts:
                 if hasattr(p, 'text') and p.text:
@@ -193,12 +192,19 @@ async def execute_agent_turn(runner, user_id, session_id, message_text):
             
     return "".join(full_response_text)
 
+import user_context
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(req: ChatRequest, user: dict = Depends(verify_token)):
     session_id = req.session_id or str(uuid.uuid4())
     user_id = user.get("uid", "default_user")
     user_email = user.get("email", "unknown")
-    logger.info(f"Chat request from {user_email} (uid: {user_id})")
+    user_role = user.get("role", "viewer")
+    
+    logger.info(f"Chat request from {user_email} (role: {user_role})")
+    
+    # SET USER CONTEXT FOR THIS REQUEST
+    user_context.set_user_context(user_email, user_role)
     
     # Ensure session exists
     if session_id not in known_sessions:
@@ -211,9 +217,6 @@ async def chat_endpoint(req: ChatRequest, user: dict = Depends(verify_token)):
             known_sessions.add(session_id)
             logger.info(f"Created new session: {session_id}")
         except Exception as e:
-            # If it already exists (e.g. from restarted server but persistent store?), ignore. 
-            # But InMemory implies it's empty on start. 
-            # If concurrently called, might race.
             logger.warning(f"Session creation warning: {e}")
             known_sessions.add(session_id)
 

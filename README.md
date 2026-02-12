@@ -19,14 +19,7 @@ A secure, **Multi-Agent System** for managing Google Compute Engine infrastructu
 
 The system follows a split architecture deployed on **Google Cloud Run**:
 
-```mermaid
-graph LR
-    User["User (Browser)"] -->|"HTTPS + Firebase Auth"| Frontend["Flutter Web App"]
-    Frontend -->|"JWT Bearer Token"| Backend["FastAPI Backend"]
-    Backend -->|"Verify Token"| Firestore["Firestore (Allowlist)"]
-    Backend -->|"LLM Reasoning"| Gemini["Gemini 2.5 Pro"]
-    Backend -->|"MCP Ops"| GCE["Compute Engine API"]
-```
+![Architecture Diagram](images/architecture.png)
 
 - **Frontend**: Flutter Web (Material 3) served via Nginx container.
 - **Backend**: Python 3.13 + FastAPI + ADK (`LlmAgent`).

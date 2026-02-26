@@ -25,7 +25,7 @@ El sistema implementa el enfoque de arquitecturas separadas (*Split Architecture
 
 ### 1.2 Capa de API Core y Middleware (`server.py`)
 *   **Stack Tecnológico:** FastAPI (Python asíncrono).
-*   **TTL Auth Cache:** Para optimizar la latencia y limitar solicitudes redundantes hacia la BBDD de Firestore, FastAPI implementa caché de autenticación de 5 minutos, mapeando `email` a `(timestamp, is_allowed, role)`.
+*   **Smart Auth Cache:** Para optimizar la latencia y limitar solicitudes redundantes hacia Firestore, FastAPI implementa caché inteligente: 5 minutos para usuarios permitidos y **30 segundos** para intentos denegados (minimizando fricción en nuevos accesos).
 *   **Inyección Paritaria de Contextos:** Intercepta la solicitud HTTP, valida criptográficamente el token con el SDK Administrativo de Firebase y escribe dinámicamente las variables de permiso (Admin vs Viewer) en un contexto transaccional persistente inter-hilos (`user_context.py`), antes de lanzar ciclos de razonamiento usando ADK.
 *   **Manejo de Respuestas de Eventos:** El endpoint `/chat` canaliza y acumula las respuestas multipartes que Gemini va arrojando (`types.Content`) desde la librería y las entrega como un modelo pydantic consolidado.
 

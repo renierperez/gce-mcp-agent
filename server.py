@@ -61,7 +61,8 @@ from firebase_admin import auth, credentials, firestore
 
 # Auth Cache: {email: (timestamp, is_allowed, role)}
 _auth_cache = {}
-AUTH_CACHE_TTL = 300  # 5 minutes
+AUTH_CACHE_TTL = 300  # 5 minutes for allowed users
+AUTH_CACHE_DENY_TTL = 30  # 30 seconds for denied users
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Security(security)):
     token = credentials.credentials
@@ -74,7 +75,10 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Security(security))
         now = time.time()
         if email in _auth_cache:
             ts, is_allowed, role = _auth_cache[email]
-            if now - ts < AUTH_CACHE_TTL:
+            # Use different TTL based on allowance
+            ttl = AUTH_CACHE_TTL if is_allowed else AUTH_CACHE_DENY_TTL
+            
+            if now - ts < ttl:
                 if not is_allowed:
                      logger.warning(f"Unauthorized access attempt by {email} (Cached Deny)")
                      raise HTTPException(

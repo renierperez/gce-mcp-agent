@@ -1042,7 +1042,7 @@ async def _get_instance_details_string(project_id, zone, instance_obj, true_cost
         logger.error(f"Error formatting instance details: {e}")
         return f"### Instance SKU Report: {instance_obj.name} (Error fetching details)"
 
-async def create_custom_instance(name, project_id=None, machine_type="n2-custom-2-4096", image_family="rhel-9", boot_disk_size="10", extra_disk_size="0"):
+async def create_custom_instance(name: str, project_id: str = None, machine_type: str = "n2-custom-2-4096", image_family: str = "rhel-9", boot_disk_size: str = "10", extra_disk_size: str = "0"):
     """
     Creates a new custom instance.
     REQUIRES 'admin' ROLE.
